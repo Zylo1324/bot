@@ -1,7 +1,0 @@
-<svg width="800" height="450" viewBox="0 0 800 450" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <rect x="80" y="40" width="640" height="360" rx="32" fill="#111" stroke="#2F2F31" stroke-width="6" />
-  <rect x="120" y="80" width="560" height="280" rx="16" fill="#1F1F1F" />
-  <rect x="60" y="400" width="680" height="24" rx="12" fill="#C7C7CC" />
-  <rect x="280" y="410" width="240" height="10" rx="5" fill="#E5E5EA" />
-  <text x="50%" y="210" text-anchor="middle" fill="#F5F5F7" font-family="'SF Pro Display', 'Helvetica Neue', Arial" font-size="48" font-weight="600">MacBook Air</text>
-</svg>
