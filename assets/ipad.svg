@@ -1,6 +1,0 @@
-<svg width="800" height="600" viewBox="0 0 800 600" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <rect x="140" y="60" width="520" height="440" rx="48" fill="#111" stroke="#2C2C2E" stroke-width="8" />
-  <rect x="190" y="120" width="420" height="320" rx="32" fill="#1C1C1E" />
-  <circle cx="400" cy="520" r="16" fill="#3A3A3C" />
-  <text x="50%" y="300" text-anchor="middle" fill="#F5F5F7" font-family="'SF Pro Display', 'Helvetica Neue', Arial" font-size="48" font-weight="600">iPad Pro</text>
-</svg>
