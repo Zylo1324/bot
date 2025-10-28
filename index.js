@@ -5,15 +5,12 @@ import makeWASocket, {
   useMultiFileAuthState
 } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
-import dotenv from 'dotenv';
 import OpenAI from 'openai';
 import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
 import process from 'node:process';
 
 import { runSelfCheck } from './scripts/selfcheck.mjs';
-
-dotenv.config();
 
 const ensureEnvLoaded = () => {
   const envPath = resolve(process.cwd(), '.env');
