@@ -5,12 +5,15 @@ import makeWASocket, {
   useMultiFileAuthState
 } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
+import dotenv from 'dotenv';
 import OpenAI from 'openai';
 import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
 import process from 'node:process';
 
 import { runSelfCheck } from './scripts/selfcheck.mjs';
+
+dotenv.config();
 
 const ensureEnvLoaded = () => {
   const envPath = resolve(process.cwd(), '.env');
@@ -120,13 +123,10 @@ async function sendTextHuman(sock, to, body, typingMs = 1500) {
 
 const handled = new Set(); // anti-duplicados
 
-let openaiClient = null;
-if (process.env.OPENAI_API_KEY && process.env.OPENAI_BASE_URL) {
-  openaiClient = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-    baseURL: process.env.OPENAI_BASE_URL
-  });
-}
+const openaiClient = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  baseURL: process.env.OPENAI_BASE_URL
+});
 
 class ChatCompletionError extends Error {
   constructor(message, { status, code, isRetryable, originalError } = {}) {
@@ -187,8 +187,6 @@ const buildModelMessages = ({
   ];
 };
 
-const getModelName = () => process.env.MODEL || 'glm-4.5';
-
 const callChatCompletion = async (messages) => {
   if (!openaiClient) {
     throw new ChatCompletionError('Cliente de OpenAI no configurado.', {
@@ -198,15 +196,16 @@ const callChatCompletion = async (messages) => {
     });
   }
 
-  const model = getModelName();
   const maxAttempts = 3;
   let delay = 600;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
+      const formattedMessages = messages.map(({ role, content }) => ({ role, content }));
+
       const completion = await openaiClient.chat.completions.create({
-        model,
-        messages,
+        model: process.env.MODEL || 'glm-4.5',
+        messages: formattedMessages,
         temperature: 0.75,
         presence_penalty: 0.4,
         frequency_penalty: 0.4
@@ -225,6 +224,13 @@ const callChatCompletion = async (messages) => {
     } catch (error) {
       const normalized = normalizeOpenAIError(error);
       const { status, code, isRetryable } = normalized;
+      if (status === 401) {
+        console.error(
+          'Error de autenticación con OpenAI (401):',
+          normalized.originalError?.cause ?? normalized.originalError ?? normalized.message
+        );
+        return 'Estoy teniendo un problema de autenticación con el servicio. Dame un momento mientras lo solucionamos 🙏';
+      }
       console.error(
         '[Modelo] Error en intento %d: status=%s code=%s mensaje=%s',
         attempt,
