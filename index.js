@@ -8,6 +8,9 @@ import qrcode from 'qrcode-terminal';
 import OpenAI from 'openai';
 import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
+import process from 'node:process';
+
+import { runSelfCheck } from './scripts/selfcheck.mjs';
 
 const ensureEnvLoaded = () => {
   const envPath = resolve(process.cwd(), '.env');
@@ -34,6 +37,73 @@ const jitter = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const lastSentAt = new Map(); // jid -> timestamp
 const MIN_GAP_MS = 1200; // 1.2s mínimo entre mensajes por chat
 
+const AUTH_FOLDER = './auth_state';
+const COMMAND_PREFIX = '/';
+const NETWORK_ERROR_CODES = new Set(['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN']);
+
+const SERVICE_KEYWORDS = new Map([
+  ['web', 'sitios web a medida'],
+  ['página', 'sitios web a medida'],
+  ['paginas', 'sitios web a medida'],
+  ['ecommerce', 'tiendas en línea'],
+  ['tienda', 'tiendas en línea'],
+  ['ads', 'campañas de anuncios'],
+  ['anuncio', 'campañas de anuncios'],
+  ['meta', 'campañas de anuncios'],
+  ['instagram', 'gestión de redes sociales'],
+  ['facebook', 'gestión de redes sociales'],
+  ['seo', 'optimización SEO'],
+  ['posicionamiento', 'optimización SEO']
+]);
+
+const PRICE_KEYWORDS = ['precio', 'cuánto', 'coste', 'costo', 'vale', 'tarifa', 'plan', 'planes', 'presupuesto'];
+
+const fallbackResponses = {
+  pricing: [
+    (name) =>
+      `${name ? `Hola ${name}! ` : '¡Hola! '}Tenemos planes flexibles desde $99 al mes e incluyen soporte dedicado. ¿Te preparo un resumen con la promo vigente y agendamos una llamada corta? 🙂`,
+    (name) =>
+      `${name ? `Hola ${name}! ` : '¡Hola! '}Gracias por tu interés. Podemos armarte una propuesta con descuento de bienvenida y dejar todo listo hoy mismo. ¿Te envío la comparativa de planes para que elijas el ideal?`
+  ],
+  service: [
+    (name, service) =>
+      `${name ? `Hola ${name}! ` : '¡Hola! '}Justo ayudamos a clientes con ${service || 'el servicio que buscas'}. Podemos iniciar con un diagnóstico rápido y entregarte una propuesta personalizada. ¿Agendamos una breve llamada?`,
+    (name, service) =>
+      `${name ? `Hola ${name}! ` : '¡Hola! '}Podemos encargarnos de ${service || 'tu proyecto'} y acompañarte hasta el lanzamiento. ¿Te comparto casos de éxito y avanzamos con una reunión esta semana? 🚀`
+  ],
+  general: [
+    (name) =>
+      `${name ? `Hola ${name}! ` : '¡Hola! '}Estoy listo para ayudarte y encontrar la solución que mejor se adapte. ¿Te parece si coordinamos una llamada para definir próximos pasos?`,
+    (name) =>
+      `${name ? `Hola ${name}! ` : '¡Hola! '}Encantado de conocerte. Cuéntame lo que necesitas y preparo una propuesta concreta para que tomes decisión hoy mismo. ¿Agendamos una charla rápida?`
+  ]
+};
+
+const analyzeMessage = (text) => {
+  const lower = text.toLowerCase();
+  const intent = PRICE_KEYWORDS.some((keyword) => lower.includes(keyword))
+    ? 'pricing'
+    : Array.from(SERVICE_KEYWORDS.keys()).some((keyword) => lower.includes(keyword))
+    ? 'service'
+    : 'general';
+
+  let serviceFocus = null;
+  for (const [keyword, label] of SERVICE_KEYWORDS.entries()) {
+    if (lower.includes(keyword)) {
+      serviceFocus = label;
+      break;
+    }
+  }
+
+  return { intent, serviceFocus };
+};
+
+const selectFallbackResponse = ({ name, intent, serviceFocus }) => {
+  const group = fallbackResponses[intent] || fallbackResponses.general;
+  const template = group[Math.floor(Math.random() * group.length)];
+  return template(name, serviceFocus);
+};
+
 async function sendTextHuman(sock, to, body, typingMs = 1500) {
   const now = Date.now();
   const last = lastSentAt.get(to) || 0;
@@ -50,43 +120,205 @@ async function sendTextHuman(sock, to, body, typingMs = 1500) {
 
 const handled = new Set(); // anti-duplicados
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  baseURL: process.env.OPENAI_BASE_URL
-});
-
-async function responderIA(mensajeCliente) {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error('OPENAI_API_KEY no configurada');
-  }
-
-  if (!process.env.MODEL) {
-    throw new Error('MODEL no configurado');
-  }
-
-  const completion = await openai.chat.completions.create({
-    model: process.env.MODEL,
-    messages: [
-      {
-        role: 'system',
-        content:
-          'Eres un vendedor experto, amable, empático y convincente. Usas emojis, tono natural y guías al cliente a cerrar la compra. No suenes robótico ni repitas frases.'
-      },
-      { role: 'user', content: mensajeCliente }
-    ]
+let openaiClient = null;
+if (process.env.OPENAI_API_KEY && process.env.OPENAI_BASE_URL) {
+  openaiClient = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+    baseURL: process.env.OPENAI_BASE_URL
   });
-
-  const response = completion.choices?.[0]?.message?.content?.trim();
-  if (!response) {
-    throw new Error('La respuesta del modelo llegó vacía');
-  }
-
-  return response;
 }
 
-// Definición de constantes globales para configurar el comportamiento del bot
-const AUTH_FOLDER = './auth_state';
-const COMMAND_PREFIX = '/';
+class ChatCompletionError extends Error {
+  constructor(message, { status, code, isRetryable, originalError } = {}) {
+    super(message);
+    this.name = 'ChatCompletionError';
+    this.status = status;
+    this.code = code;
+    this.isRetryable = Boolean(isRetryable);
+    this.originalError = originalError;
+  }
+}
+
+const normalizeOpenAIError = (error) => {
+  if (error instanceof ChatCompletionError) {
+    return error;
+  }
+
+  const status = error?.status ?? error?.response?.status ?? error?.cause?.statusCode ?? null;
+  const code = error?.code ?? error?.cause?.code ?? error?.error?.code ?? null;
+  const isNetwork = code && NETWORK_ERROR_CODES.has(code);
+  const isRetryable = Boolean((status && status >= 500) || status === 408 || isNetwork);
+
+  return new ChatCompletionError(error?.message || 'Error al invocar el modelo.', {
+    status,
+    code,
+    isRetryable,
+    originalError: error
+  });
+};
+
+const buildModelMessages = ({
+  contactName,
+  text,
+  intent,
+  serviceFocus
+}) => {
+  const modelIntentSummary = [
+    `Nombre reportado: ${contactName || 'desconocido'}.`,
+    `Intención detectada: ${intent}.`,
+    serviceFocus ? `Servicio mencionado: ${serviceFocus}.` : 'Sin servicio concreto detectado.',
+    'Objetivo: guiar con calidez, responder dudas y llevar al cierre con una propuesta clara.'
+  ].join('\n');
+
+  return [
+    {
+      role: 'system',
+      content:
+        'Eres un vendedor experto, amable, empático y convincente. Habla en español natural, usa como máximo dos emojis oportunos, evita sonar robótico y varía tus frases. Saluda usando el nombre del cliente solo la primera vez. Identifica si busca precios o un servicio específico y ofrece siguientes pasos concretos orientados al cierre.'
+    },
+    {
+      role: 'system',
+      content: modelIntentSummary
+    },
+    {
+      role: 'user',
+      content: text
+    }
+  ];
+};
+
+const getModelName = () => process.env.MODEL || 'glm-4.5';
+
+const callChatCompletion = async (messages) => {
+  if (!openaiClient) {
+    throw new ChatCompletionError('Cliente de OpenAI no configurado.', {
+      code: 'config',
+      status: 0,
+      isRetryable: false
+    });
+  }
+
+  const model = getModelName();
+  const maxAttempts = 3;
+  let delay = 600;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const completion = await openaiClient.chat.completions.create({
+        model,
+        messages,
+        temperature: 0.75,
+        presence_penalty: 0.4,
+        frequency_penalty: 0.4
+      });
+
+      const response = completion.choices?.[0]?.message?.content?.trim();
+      if (!response) {
+        throw new ChatCompletionError('La respuesta del modelo llegó vacía.', {
+          status: completion?.status ?? 502,
+          code: 'empty_response',
+          isRetryable: attempt < maxAttempts
+        });
+      }
+
+      return response;
+    } catch (error) {
+      const normalized = normalizeOpenAIError(error);
+      const { status, code, isRetryable } = normalized;
+      console.error(
+        '[Modelo] Error en intento %d: status=%s code=%s mensaje=%s',
+        attempt,
+        status ?? 'n/a',
+        code ?? 'n/a',
+        normalized.message
+      );
+
+      if (isRetryable && attempt < maxAttempts) {
+        await sleep(delay + jitter(200, 600));
+        delay *= 2;
+        continue;
+      }
+
+      throw normalized;
+    }
+  }
+
+  throw new ChatCompletionError('No se pudo obtener respuesta del modelo tras varios intentos.', {
+    status: 504,
+    code: 'max_retries',
+    isRetryable: false
+  });
+};
+
+const responderIA = async ({ contactName, text }) => {
+  const analysis = analyzeMessage(text);
+
+  if (fallbackMode) {
+    return selectFallbackResponse({
+      name: contactName,
+      intent: analysis.intent,
+      serviceFocus: analysis.serviceFocus
+    });
+  }
+
+  const messages = buildModelMessages({
+    contactName,
+    text,
+    intent: analysis.intent,
+    serviceFocus: analysis.serviceFocus
+  });
+
+  return callChatCompletion(messages);
+};
+
+const handledConnectionIssue = (type) => {
+  switch (type) {
+    case 'auth':
+      return 'Se detectó un problema de autenticación (401).';
+    case 'quota':
+      return 'Se detectaron límites o cuotas (403/429).';
+    case 'network':
+      return 'Se detectó un problema de red/DNS.';
+    default:
+      return 'Se detectó un fallo en el autodiagnóstico inicial.';
+  }
+};
+
+let fallbackMode = false;
+let fallbackReason = null;
+
+const activateFallback = (reason) => {
+  if (fallbackMode) return;
+  fallbackMode = true;
+  fallbackReason = reason;
+  console.warn('Activando modo fallback local: %s', reason);
+};
+
+const runStartupSelfCheck = async () => {
+  try {
+    const result = await runSelfCheck({ silent: true });
+    if (!result.ok) {
+      activateFallback(handledConnectionIssue(result.type));
+      console.error('[Selfcheck] %s', result.message);
+    } else {
+      console.log('[Selfcheck] Conexión verificada. Modelos detectados:', result.models.join(', ') || 'no especificados');
+    }
+  } catch (error) {
+    activateFallback('Se detectó un error inesperado en el autodiagnóstico inicial.');
+    console.error('[Selfcheck] Error inesperado.', error);
+  }
+};
+
+await runStartupSelfCheck();
+
+async function sendFallbackTechnicalIssue(sock, chatId) {
+  await sendTextHuman(
+    sock,
+    chatId,
+    'Estoy con inconvenientes técnicos temporales. ¿Te parece si vuelvo a intentar en un minuto?',
+    1200
+  );
+}
 
 // Utilidad para obtener el texto sin importar el tipo de mensaje recibido
 const getMessageText = (message = {}) => {
@@ -120,6 +352,9 @@ const startBot = async () => {
 
     if (connection === 'open') {
       console.log('Bot conectado correctamente.');
+      if (fallbackMode && fallbackReason) {
+        console.warn('Modo fallback activo: %s', fallbackReason);
+      }
     }
 
     if (connection === 'close') {
@@ -157,10 +392,8 @@ const startBot = async () => {
     try {
       if (!lower.startsWith(COMMAND_PREFIX)) {
         const contactName = (m.pushName ?? '').trim();
-        const messageForModel = contactName
-          ? `Cliente ${contactName}: ${normalized}`
-          : normalized;
-        const reply = await responderIA(messageForModel);
+
+        const reply = await responderIA({ contactName, text: normalized });
         await sendTextHuman(sock, from, reply, 1800);
         return;
       }
@@ -179,12 +412,12 @@ const startBot = async () => {
       }
 
       if (cmd === '/precios') {
-        await sendTextHuman(sock, from, 'Planes desde $10 (demo).', 1500);
+        await sendTextHuman(sock, from, 'Planes desde $99/mes con soporte premium incluido.', 1500);
         return;
       }
 
       if (cmd === '/soporte') {
-        await sendTextHuman(sock, from, 'Contacta a soporte. Deja tu mensaje.', 1700);
+        await sendTextHuman(sock, from, 'Contacta a soporte. Deja tu mensaje y te respondemos en breve.', 1700);
         return;
       }
 
@@ -195,17 +428,27 @@ const startBot = async () => {
 
       await sendTextHuman(sock, from, 'Comando no reconocido. Usa /cmds', 1600);
     } catch (error) {
-      console.error('Error al procesar un mensaje:', error);
-      try {
-        await sendTextHuman(
-          sock,
-          from,
-          'Lo siento, estoy teniendo inconvenientes técnicos en este momento. ¿Podrías intentar nuevamente en unos instantes?',
-          1200
-        );
-      } catch (sendError) {
-        console.error('No se pudo enviar el mensaje de error:', sendError);
+      const normalizedError = normalizeOpenAIError(error);
+      console.error('Error al procesar un mensaje:', {
+        status: normalizedError.status,
+        code: normalizedError.code,
+        message: normalizedError.message
+      });
+
+      if (normalizedError.status === 401) {
+        console.warn('Detalle: Token inválido o expirado (401).');
+        activateFallback(handledConnectionIssue('auth'));
+      } else if (normalizedError.status === 403 || normalizedError.status === 429) {
+        console.warn('Detalle: Restricción o cuota (status %s).', normalizedError.status);
+        activateFallback(handledConnectionIssue('quota'));
+      } else if (NETWORK_ERROR_CODES.has(normalizedError.code)) {
+        console.warn('Detalle: Posible problema de red (%s).', normalizedError.code);
+        activateFallback(handledConnectionIssue('network'));
+      } else if (normalizedError.code === 'config') {
+        activateFallback('Configuración incompleta del cliente OpenAI.');
       }
+
+      await sendFallbackTechnicalIssue(sock, from);
     }
   });
 };
