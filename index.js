@@ -5,13 +5,13 @@ import makeWASocket, {
   useMultiFileAuthState
 } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import OpenAI from 'openai';
 import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
 
 const ensureEnvLoaded = () => {
   const envPath = resolve(process.cwd(), '.env');
-  if (process.env.GEMINI_API_KEY || !existsSync(envPath)) return;
+  if (!existsSync(envPath)) return;
 
   const content = readFileSync(envPath, 'utf8');
   for (const line of content.split(/\r?\n/)) {
@@ -27,187 +27,6 @@ const ensureEnvLoaded = () => {
 };
 
 ensureEnvLoaded();
-
-const SERVICES = {
-  disney: 'Disney Premium + ESPN ➜ Perfil S/5',
-  hbomax: 'HBO Max Platino ➜ Perfil S/5',
-  prime: 'Prime Video ➜ Perfil S/4',
-  chatgpt: 'ChatGPT Plus ➜ Compartido S/10 | Cuenta completa S/20 (incluye Canva gratis)',
-  perplexity: 'Perplexity ➜ Cuenta S/8',
-  gemini: 'Gemini + Veo 3 (1 año) ➜ Cuenta S/30',
-  capcut: 'Capcut ➜ Cuenta S/15',
-  turnitin: 'Turnitin Estudiante ➜ Cuenta S/15',
-  ytpremium: 'YouTube Premium + YT Music ➜ A tu correo S/5',
-  directv: 'DirecTV ➜ Activación S/15',
-  luna: 'Luna (Gaming) ➜ Cuenta S/20',
-  scribd: 'Scribd Premium ➜ Cuenta S/4',
-  canva: 'Canva ➜ Cuenta S/4',
-  vip: 'Grupo VIP ➜ S/20'
-};
-
-const SYNONYMS = {
-  disney: ['disney', 'disney+', 'disney plus', 'disneyplus', 'espn', 'espn+', 'espnplus', 'star plus', 'star+'],
-  hbomax: ['hbo max', 'hbomax', 'hbo', 'max app', 'max latino'],
-  prime: ['prime video', 'primevideo', 'amazon prime', 'amazon prime video', 'amazon video'],
-  chatgpt: ['chatgpt', 'chat gpt', 'gpt', 'openai', 'chat gpt plus', 'chatgpt plus'],
-  perplexity: ['perplexity', 'perplexity ai', 'perplexity pro'],
-  gemini: ['gemini', 'google gemini', 'gemini advanced', 'veo 3', 'veo3'],
-  capcut: ['capcut', 'cap cut', 'capcut pro'],
-  turnitin: ['turnitin', 'turn it in'],
-  ytpremium: ['youtube premium', 'yt premium', 'youtube music', 'youtube music premium', 'yt music', 'ytmusic'],
-  directv: ['directv', 'direct tv', 'direct tv go', 'dtv'],
-  luna: ['luna', 'amazon luna'],
-  scribd: ['scribd', 'scribd premium'],
-  canva: ['canva', 'canva pro'],
-  vip: ['vip', 'grupo vip', 'grupo premium']
-};
-
-const SERVICES_FULL_LIST = Object.values(SERVICES)
-  .map((service) => `• ${service}`)
-  .join('\n');
-
-const PRICE_KEYWORDS = [
-  'precio',
-  'precios',
-  'lista',
-  'lista de precios',
-  'servicios',
-  'servicio',
-  'cuanto cuesta',
-  'cuánto cuesta',
-  'cuanto sale',
-  'cuánto sale',
-  'costos',
-  'tarifas',
-  'planes',
-  'catalogo',
-  'catálogo'
-];
-
-const toPlain = (value) =>
-  value
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '');
-
-function localDetect(text) {
-  const normalized = text.toLowerCase();
-  const plain = toPlain(text);
-  const haystack = [normalized, plain];
-
-  for (const [service, synonyms] of Object.entries(SYNONYMS)) {
-    const normalizedSynonyms = synonyms.map((syn) => ({
-      raw: syn,
-      plain: toPlain(syn)
-    }));
-    const found = normalizedSynonyms.some(({ raw, plain: synonymPlain }) =>
-      haystack.some((candidate) =>
-        candidate.includes(raw) || candidate.includes(synonymPlain)
-      )
-    );
-    if (found) {
-      return { intent: 'service', service };
-    }
-  }
-
-  const priceDetected = PRICE_KEYWORDS.some((keyword) =>
-    haystack.some((candidate) => candidate.includes(keyword))
-  );
-
-  if (priceDetected) {
-    return { intent: 'prices', service: null };
-  }
-
-  return { intent: 'unknown', service: null };
-}
-
-async function geminiDetect(text, timeoutMs = 1800) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error('Gemini API key not configured');
-  }
-
-  const client = new GoogleGenerativeAI(apiKey);
-  const model = client.getGenerativeModel({ model: 'gemini-1.5-flash' });
-  const synonymsTable = Object.entries(SYNONYMS)
-    .map(([service, words]) => `${service}: ${words.join(', ')}`)
-    .join('\n');
-
-  const detectionPromise = (async () => {
-    const result = await model.generateContent({
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text: [
-                'Clasifica la intención del siguiente mensaje de WhatsApp.',
-                'Responde únicamente en JSON con este esquema exacto:',
-                '{ "intent": "prices" | "service" | "unknown", "service": "disney" | "hbomax" | "prime" | "chatgpt" | "perplexity" | "gemini" | "capcut" | "turnitin" | "ytpremium" | "directv" | "luna" | "scribd" | "canva" | "vip" | null }',
-                'Si el usuario pregunta por precios generales, usa intent "prices" y service null.',
-                'Si menciona un servicio específico, usa intent "service" y la clave correspondiente.',
-                'Si no hay suficiente contexto, responde intent "unknown" y service null.',
-                'Sinónimos permitidos por servicio:',
-                synonymsTable,
-                `Mensaje: """${text}"""`
-              ].join('\n')
-            }
-          ]
-        }
-      ],
-      generationConfig: {
-        responseMimeType: 'application/json'
-      }
-    });
-
-    const responseText = result.response?.text?.() ?? '';
-    if (!responseText) {
-      throw new Error('Gemini response empty');
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(responseText);
-    } catch (error) {
-      throw new Error('Gemini response not valid JSON');
-    }
-
-    const intents = new Set(['prices', 'service', 'unknown']);
-    if (!parsed || !intents.has(parsed.intent)) {
-      throw new Error('Gemini response missing intent');
-    }
-
-    const rawService = parsed.service === 'null' ? null : parsed.service;
-    const service = rawService === undefined ? null : rawService;
-    if (service !== null && !Object.prototype.hasOwnProperty.call(SERVICES, service)) {
-      throw new Error('Gemini response service out of range');
-    }
-
-    return { intent: parsed.intent, service };
-  })();
-
-  return await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Gemini detect timeout')), timeoutMs);
-    detectionPromise
-      .then((value) => {
-        clearTimeout(timer);
-        resolve(value);
-      })
-      .catch((error) => {
-        clearTimeout(timer);
-        reject(error);
-      });
-  });
-}
-
-async function detectIntent(text) {
-  try {
-    return await geminiDetect(text);
-  } catch (error) {
-    console.warn('Fallo la detección con Gemini, usando detector local:', error?.message || error);
-    return localDetect(text);
-  }
-}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const jitter = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
@@ -230,6 +49,42 @@ async function sendTextHuman(sock, to, body, typingMs = 1500) {
 }
 
 const handled = new Set(); // anti-duplicados
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  baseURL: process.env.OPENAI_BASE_URL
+});
+
+async function createSalesReply(messageText) {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY no configurada');
+  }
+
+  if (!process.env.MODEL) {
+    throw new Error('MODEL no configurado');
+  }
+
+  const completion = await openai.chat.completions.create({
+    model: process.env.MODEL,
+    messages: [
+      {
+        role: 'system',
+        content: 'Eres un asistente IA experto en ventas, natural, empático y persuasivo.'
+      },
+      {
+        role: 'user',
+        content: messageText
+      }
+    ]
+  });
+
+  const response = completion.choices?.[0]?.message?.content?.trim();
+  if (!response) {
+    throw new Error('La respuesta del modelo llegó vacía');
+  }
+
+  return response;
+}
 
 // Definición de constantes globales para configurar el comportamiento del bot
 const AUTH_FOLDER = './auth_state';
@@ -301,32 +156,14 @@ const startBot = async () => {
     if (!normalized) return;
 
     const lower = normalized.toLowerCase();
-    const contactName = (m.pushName ?? '').trim();
-    const greeting = contactName ? `¡Hola ${contactName}!` : '¡Hola!';
-
     try {
       if (!lower.startsWith(COMMAND_PREFIX)) {
-        const { intent, service } = await detectIntent(normalized);
-
-        if (intent === 'prices') {
-          const variants = [
-            `${greeting} Te comparto nuestros servicios disponibles:\n${SERVICES_FULL_LIST}`,
-            `${greeting} Estos son los precios actualizados:\n${SERVICES_FULL_LIST}`,
-            `${greeting} Aquí tienes la lista completa para que elijas lo que prefieras:\n${SERVICES_FULL_LIST}`
-          ];
-          const message = variants[Math.floor(Math.random() * variants.length)];
-          await sendTextHuman(sock, from, message, 1800);
-          return;
-        }
-
-        if (intent === 'service' && service && SERVICES[service]) {
-          const message = `${greeting} Sí 💫, ${SERVICES[service]}. ¿Deseas continuar con la compra o tienes otra duda?`;
-          await sendTextHuman(sock, from, message, 1700);
-          return;
-        }
-
-        const fallbackMessage = `${greeting} ¿Quieres ver 1) precios y servicios o 2) consultar un servicio específico?`;
-        await sendTextHuman(sock, from, fallbackMessage, 1600);
+        const contactName = (m.pushName ?? '').trim();
+        const messageForModel = contactName
+          ? `Cliente ${contactName}: ${normalized}`
+          : normalized;
+        const reply = await createSalesReply(messageForModel);
+        await sendTextHuman(sock, from, reply, 1800);
         return;
       }
 
@@ -361,6 +198,16 @@ const startBot = async () => {
       await sendTextHuman(sock, from, 'Comando no reconocido. Usa /cmds', 1600);
     } catch (error) {
       console.error('Error al procesar un mensaje:', error);
+      try {
+        await sendTextHuman(
+          sock,
+          from,
+          'Lo siento, estoy teniendo inconvenientes técnicos en este momento. ¿Podrías intentar nuevamente en unos instantes?',
+          1200
+        );
+      } catch (sendError) {
+        console.error('No se pudo enviar el mensaje de error:', sendError);
+      }
     }
   });
 };
