@@ -31,6 +31,25 @@ const ensureEnvLoaded = () => {
 
 ensureEnvLoaded();
 
+const REQUIRED_ENV_VARS = [
+  { key: 'OPENAI_API_KEY', description: 'tu clave de API de OpenAI' },
+  { key: 'OPENAI_BASE_URL', description: 'la URL base del servicio compatible con OpenAI' },
+  { key: 'MODEL', description: 'el identificador del modelo a utilizar' }
+];
+
+const missingEnvVars = REQUIRED_ENV_VARS.filter(({ key }) => {
+  const value = process.env[key];
+  return typeof value !== 'string' || value.trim() === '';
+});
+
+if (missingEnvVars.length > 0) {
+  console.error('[Config] Faltan variables de entorno requeridas:');
+  for (const { key, description } of missingEnvVars) {
+    console.error(`- ${key}: ${description}. Configúrala en el archivo .env o en tu entorno.`);
+  }
+  process.exit(1);
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const jitter = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
