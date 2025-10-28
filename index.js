@@ -6,17 +6,31 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const jitter = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+const lastSentAt = new Map(); // jid -> timestamp
+const MIN_GAP_MS = 1200; // 1.2s mínimo entre mensajes por chat
+
+async function sendTextHuman(sock, to, body, typingMs = 1500) {
+  const now = Date.now();
+  const last = lastSentAt.get(to) || 0;
+  const wait = Math.max(0, MIN_GAP_MS - (now - last));
+  if (wait > 0) await sleep(wait);
+
+  await sock.sendPresenceUpdate('composing', to);
+  await sleep(typingMs + jitter(200, 800));
+  await sock.sendPresenceUpdate('paused', to);
+
+  await sock.sendMessage(to, { text: body });
+  lastSentAt.set(to, Date.now());
+}
+
+const handled = new Set(); // anti-duplicados
+
 // Definición de constantes globales para configurar el comportamiento del bot
 const AUTH_FOLDER = './auth_state';
 const COMMAND_PREFIX = '/';
-
-// Tabla de respuestas disponibles para cada comando soportado
-const COMMAND_RESPONSES = {
-  '/cmds': `Comandos disponibles:\n/cmds - Lista de comandos\n/precios - Información de planes\n/soporte - Contactar soporte\n/info - Información del bot`,
-  '/precios': 'Planes desde $10',
-  '/soporte': 'Contacta al soporte técnico',
-  '/info': 'Soy un bot hecho con Baileys y Node.js'
-};
 
 // Utilidad para obtener el texto sin importar el tipo de mensaje recibido
 const getMessageText = (message = {}) => {
@@ -25,29 +39,6 @@ const getMessageText = (message = {}) => {
   if (message.imageMessage?.caption) return message.imageMessage.caption;
   if (message.videoMessage?.caption) return message.videoMessage.caption;
   return null;
-};
-
-// Responde a los mensajes entrantes en función del comando detectado
-const handleIncomingMessage = async (sock, msg) => {
-  const text = getMessageText(msg.message);
-  if (!text || msg.key.fromMe) return;
-
-  const normalizedText = text.trim();
-  const chatId = msg.key.remoteJid;
-
-  if (!normalizedText.startsWith(COMMAND_PREFIX)) {
-    await sock.sendMessage(chatId, { text: 'Modo comandos. Escribe /cmds' });
-    return;
-  }
-
-  const command = normalizedText.toLowerCase();
-  const response = COMMAND_RESPONSES[command];
-
-  if (response) {
-    await sock.sendMessage(chatId, { text: response });
-  } else {
-    await sock.sendMessage(chatId, { text: 'Comando no reconocido. Escribe /cmds' });
-  }
 };
 
 // Inicializa la conexión, gestiona el QR y controla los eventos del socket
@@ -89,11 +80,60 @@ const startBot = async () => {
   });
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
-    const [msg] = messages;
-    if (!msg) return;
+    const m = messages?.[0];
+    if (!m || m.key.fromMe) return;
+
+    const from = m.key.remoteJid;
+    if (!from || from === 'status@broadcast') return;
+
+    const id = m.key.id;
+    if (!id || handled.has(id)) return;
+    handled.add(id);
+    setTimeout(() => handled.delete(id), 60_000);
+
+    const text = getMessageText(m.message) ?? '';
+    if (!text) return;
+
+    const normalized = text.trim();
+    if (!normalized) return;
+
+    const lower = normalized.toLowerCase();
 
     try {
-      await handleIncomingMessage(sock, msg);
+      if (!lower.startsWith(COMMAND_PREFIX)) {
+        await sendTextHuman(sock, from, 'Modo comandos. Escribe /cmds', 1600);
+        return;
+      }
+
+      const cmd = lower.split(/\s+/)[0];
+
+      if (cmd === '/cmds') {
+        const menu = [
+          'Comandos disponibles:',
+          '• /precios',
+          '• /soporte',
+          '• /info'
+        ].join('\n');
+        await sendTextHuman(sock, from, menu, 1800);
+        return;
+      }
+
+      if (cmd === '/precios') {
+        await sendTextHuman(sock, from, 'Planes desde $10 (demo).', 1500);
+        return;
+      }
+
+      if (cmd === '/soporte') {
+        await sendTextHuman(sock, from, 'Contacta a soporte. Deja tu mensaje.', 1700);
+        return;
+      }
+
+      if (cmd === '/info') {
+        await sendTextHuman(sock, from, 'Bot con Baileys y Node.js (demo).', 1400);
+        return;
+      }
+
+      await sendTextHuman(sock, from, 'Comando no reconocido. Usa /cmds', 1600);
     } catch (error) {
       console.error('Error al procesar un mensaje:', error);
     }
