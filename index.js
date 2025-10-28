@@ -55,7 +55,7 @@ const openai = new OpenAI({
   baseURL: process.env.OPENAI_BASE_URL
 });
 
-async function createSalesReply(messageText) {
+async function responderIA(mensajeCliente) {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error('OPENAI_API_KEY no configurada');
   }
@@ -69,12 +69,10 @@ async function createSalesReply(messageText) {
     messages: [
       {
         role: 'system',
-        content: 'Eres un asistente IA experto en ventas, natural, empático y persuasivo.'
+        content:
+          'Eres un vendedor experto, amable, empático y convincente. Usas emojis, tono natural y guías al cliente a cerrar la compra. No suenes robótico ni repitas frases.'
       },
-      {
-        role: 'user',
-        content: messageText
-      }
+      { role: 'user', content: mensajeCliente }
     ]
   });
 
@@ -162,7 +160,7 @@ const startBot = async () => {
         const messageForModel = contactName
           ? `Cliente ${contactName}: ${normalized}`
           : normalized;
-        const reply = await createSalesReply(messageForModel);
+        const reply = await responderIA(messageForModel);
         await sendTextHuman(sock, from, reply, 1800);
         return;
       }
