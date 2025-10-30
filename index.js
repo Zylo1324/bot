@@ -1,358 +1,192 @@
-// Importaciones principales y dependencias del bot de WhatsApp
+import 'dotenv/config';
+import process from 'node:process';
 import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   useMultiFileAuthState
 } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
-import OpenAI from 'openai';
-import { readFileSync, existsSync } from 'fs';
-import { resolve } from 'path';
-import process from 'node:process';
 
-import { runSelfCheck } from './scripts/selfcheck.mjs';
+import { askLLM, resetChatMemory } from './lib/groq.js';
 
-const ensureEnvLoaded = () => {
-  const envPath = resolve(process.cwd(), '.env');
-  if (!existsSync(envPath)) return;
-
-  const content = readFileSync(envPath, 'utf8');
-  for (const line of content.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const [key, ...rest] = trimmed.split('=');
-    if (!key || rest.length === 0) continue;
-    const value = rest.join('=').trim();
-    if (!Object.prototype.hasOwnProperty.call(process.env, key)) {
-      process.env[key] = value;
-    }
-  }
-};
-
-ensureEnvLoaded();
-
-const REQUIRED_ENV_VARS = [
-  { key: 'OPENAI_API_KEY', description: 'tu clave de API de OpenAI' },
-  { key: 'OPENAI_BASE_URL', description: 'la URL base del servicio compatible con OpenAI' },
-  { key: 'MODEL', description: 'el identificador del modelo a utilizar' }
-];
-
-const missingEnvVars = REQUIRED_ENV_VARS.filter(({ key }) => {
+const REQUIRED_ENV = ['GROQ_API_KEY'];
+const missingEnv = REQUIRED_ENV.filter((key) => {
   const value = process.env[key];
   return typeof value !== 'string' || value.trim() === '';
 });
 
-if (missingEnvVars.length > 0) {
-  console.error('[Config] Faltan variables de entorno requeridas:');
-  for (const { key, description } of missingEnvVars) {
-    console.error(`- ${key}: ${description}. Configúrala en el archivo .env o en tu entorno.`);
-  }
+if (missingEnv.length > 0) {
+  console.error('Faltan variables de entorno requeridas: %s', missingEnv.join(', '));
   process.exit(1);
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const jitter = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-
-const lastSentAt = new Map(); // jid -> timestamp
-const MIN_GAP_MS = 1200; // 1.2s mínimo entre mensajes por chat
-
 const AUTH_FOLDER = './auth_state';
 const COMMAND_PREFIX = '/';
-const NETWORK_ERROR_CODES = new Set(['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN']);
+const FALLBACK_REPLY = 'Ahora mismo no puedo responder, inténtalo otra vez.';
+const RATE_LIMIT_REPLY = 'Estoy procesando tu mensaje, dame un segundo 🙏';
+const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT?.trim() || 'Eres un asistente útil, amable y preciso. Responde en español.';
 
-const SERVICE_KEYWORDS = new Map([
-  ['web', 'sitios web a medida'],
-  ['página', 'sitios web a medida'],
-  ['paginas', 'sitios web a medida'],
-  ['ecommerce', 'tiendas en línea'],
-  ['tienda', 'tiendas en línea'],
-  ['ads', 'campañas de anuncios'],
-  ['anuncio', 'campañas de anuncios'],
-  ['meta', 'campañas de anuncios'],
-  ['instagram', 'gestión de redes sociales'],
-  ['facebook', 'gestión de redes sociales'],
-  ['seo', 'optimización SEO'],
-  ['posicionamiento', 'optimización SEO']
-]);
+const MIN_SEND_GAP_MS = 1_200;
+const RATE_LIMIT_WINDOW_MS = 2_000;
+const MESSAGE_CACHE_TTL_MS = 5 * 60_000;
 
-const PRICE_KEYWORDS = ['precio', 'cuánto', 'coste', 'costo', 'vale', 'tarifa', 'plan', 'planes', 'presupuesto'];
+const processedMessageIds = new Set();
+const lastSentAt = new Map();
+const rateLimitWindow = new Map();
+const rateLimitWarnedAt = new Map();
 
-const fallbackResponses = {
-  pricing: [
-    (name) =>
-      `${name ? `Hola ${name}! ` : '¡Hola! '}Tenemos planes flexibles desde $99 al mes e incluyen soporte dedicado. ¿Te preparo un resumen con la promo vigente y agendamos una llamada corta? 🙂`,
-    (name) =>
-      `${name ? `Hola ${name}! ` : '¡Hola! '}Gracias por tu interés. Podemos armarte una propuesta con descuento de bienvenida y dejar todo listo hoy mismo. ¿Te envío la comparativa de planes para que elijas el ideal?`
-  ],
-  service: [
-    (name, service) =>
-      `${name ? `Hola ${name}! ` : '¡Hola! '}Justo ayudamos a clientes con ${service || 'el servicio que buscas'}. Podemos iniciar con un diagnóstico rápido y entregarte una propuesta personalizada. ¿Agendamos una breve llamada?`,
-    (name, service) =>
-      `${name ? `Hola ${name}! ` : '¡Hola! '}Podemos encargarnos de ${service || 'tu proyecto'} y acompañarte hasta el lanzamiento. ¿Te comparto casos de éxito y avanzamos con una reunión esta semana? 🚀`
-  ],
-  general: [
-    (name) =>
-      `${name ? `Hola ${name}! ` : '¡Hola! '}Estoy listo para ayudarte y encontrar la solución que mejor se adapte. ¿Te parece si coordinamos una llamada para definir próximos pasos?`,
-    (name) =>
-      `${name ? `Hola ${name}! ` : '¡Hola! '}Encantado de conocerte. Cuéntame lo que necesitas y preparo una propuesta concreta para que tomes decisión hoy mismo. ¿Agendamos una charla rápida?`
-  ]
-};
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const analyzeMessage = (text) => {
-  const lower = text.toLowerCase();
-  const intent = PRICE_KEYWORDS.some((keyword) => lower.includes(keyword))
-    ? 'pricing'
-    : Array.from(SERVICE_KEYWORDS.keys()).some((keyword) => lower.includes(keyword))
-    ? 'service'
-    : 'general';
-
-  let serviceFocus = null;
-  for (const [keyword, label] of SERVICE_KEYWORDS.entries()) {
-    if (lower.includes(keyword)) {
-      serviceFocus = label;
-      break;
-    }
-  }
-
-  return { intent, serviceFocus };
-};
-
-const selectFallbackResponse = ({ name, intent, serviceFocus }) => {
-  const group = fallbackResponses[intent] || fallbackResponses.general;
-  const template = group[Math.floor(Math.random() * group.length)];
-  return template(name, serviceFocus);
-};
-
-async function sendTextHuman(sock, to, body, typingMs = 1500) {
-  const now = Date.now();
-  const last = lastSentAt.get(to) || 0;
-  const wait = Math.max(0, MIN_GAP_MS - (now - last));
-  if (wait > 0) await sleep(wait);
-
-  await sock.sendPresenceUpdate('composing', to);
-  await sleep(typingMs + jitter(200, 800));
-  await sock.sendPresenceUpdate('paused', to);
-
-  await sock.sendMessage(to, { text: body });
-  lastSentAt.set(to, Date.now());
+function scheduleMessageCleanup(id) {
+  if (!id) return;
+  const timeout = setTimeout(() => processedMessageIds.delete(id), MESSAGE_CACHE_TTL_MS);
+  timeout.unref?.();
 }
 
-const handled = new Set(); // anti-duplicados
-
-const openaiClient = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  baseURL: process.env.OPENAI_BASE_URL
-});
-
-class ChatCompletionError extends Error {
-  constructor(message, { status, code, isRetryable, originalError } = {}) {
-    super(message);
-    this.name = 'ChatCompletionError';
-    this.status = status;
-    this.code = code;
-    this.isRetryable = Boolean(isRetryable);
-    this.originalError = originalError;
-  }
+function markMessageProcessed(id) {
+  if (!id) return;
+  processedMessageIds.add(id);
+  scheduleMessageCleanup(id);
 }
 
-const normalizeOpenAIError = (error) => {
-  if (error instanceof ChatCompletionError) {
-    return error;
-  }
-
-  const status = error?.status ?? error?.response?.status ?? error?.cause?.statusCode ?? null;
-  const code = error?.code ?? error?.cause?.code ?? error?.error?.code ?? null;
-  const isNetwork = code && NETWORK_ERROR_CODES.has(code);
-  const isRetryable = Boolean((status && status >= 500) || status === 408 || isNetwork);
-
-  return new ChatCompletionError(error?.message || 'Error al invocar el modelo.', {
-    status,
-    code,
-    isRetryable,
-    originalError: error
-  });
-};
-
-const buildModelMessages = ({
-  contactName,
-  text,
-  intent,
-  serviceFocus
-}) => {
-  const modelIntentSummary = [
-    `Nombre reportado: ${contactName || 'desconocido'}.`,
-    `Intención detectada: ${intent}.`,
-    serviceFocus ? `Servicio mencionado: ${serviceFocus}.` : 'Sin servicio concreto detectado.',
-    'Objetivo: guiar con calidez, responder dudas y llevar al cierre con una propuesta clara.'
-  ].join('\n');
-
-  return [
-    {
-      role: 'system',
-      content:
-        'Eres un vendedor experto, amable, empático y convincente. Habla en español natural, usa como máximo dos emojis oportunos, evita sonar robótico y varía tus frases. Saluda usando el nombre del cliente solo la primera vez. Identifica si busca precios o un servicio específico y ofrece siguientes pasos concretos orientados al cierre.'
-    },
-    {
-      role: 'system',
-      content: modelIntentSummary
-    },
-    {
-      role: 'user',
-      content: text
-    }
-  ];
-};
-
-const callChatCompletion = async (messages) => {
-  if (!openaiClient) {
-    throw new ChatCompletionError('Cliente de OpenAI no configurado.', {
-      code: 'config',
-      status: 0,
-      isRetryable: false
-    });
-  }
-
-  const maxAttempts = 3;
-  let delay = 600;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      const formattedMessages = messages.map(({ role, content }) => ({ role, content }));
-
-      const completion = await openaiClient.chat.completions.create({
-        model: process.env.MODEL || 'glm-4.5',
-        messages: formattedMessages,
-        temperature: 0.75,
-        presence_penalty: 0.4,
-        frequency_penalty: 0.4
-      });
-
-      const response = completion.choices?.[0]?.message?.content?.trim();
-      if (!response) {
-        throw new ChatCompletionError('La respuesta del modelo llegó vacía.', {
-          status: completion?.status ?? 502,
-          code: 'empty_response',
-          isRetryable: attempt < maxAttempts
-        });
-      }
-
-      return response;
-    } catch (error) {
-      const normalized = normalizeOpenAIError(error);
-      const { status, code, isRetryable } = normalized;
-      if (status === 401) {
-        console.error(
-          'Error de autenticación con OpenAI (401):',
-          normalized.originalError?.cause ?? normalized.originalError ?? normalized.message
-        );
-        return 'Estoy teniendo un problema de autenticación con el servicio. Dame un momento mientras lo solucionamos 🙏';
-      }
-      console.error(
-        '[Modelo] Error en intento %d: status=%s code=%s mensaje=%s',
-        attempt,
-        status ?? 'n/a',
-        code ?? 'n/a',
-        normalized.message
-      );
-
-      if (isRetryable && attempt < maxAttempts) {
-        await sleep(delay + jitter(200, 600));
-        delay *= 2;
-        continue;
-      }
-
-      throw normalized;
-    }
-  }
-
-  throw new ChatCompletionError('No se pudo obtener respuesta del modelo tras varios intentos.', {
-    status: 504,
-    code: 'max_retries',
-    isRetryable: false
-  });
-};
-
-const responderIA = async ({ contactName, text }) => {
-  const analysis = analyzeMessage(text);
-
-  if (fallbackMode) {
-    return selectFallbackResponse({
-      name: contactName,
-      intent: analysis.intent,
-      serviceFocus: analysis.serviceFocus
-    });
-  }
-
-  const messages = buildModelMessages({
-    contactName,
-    text,
-    intent: analysis.intent,
-    serviceFocus: analysis.serviceFocus
-  });
-
-  return callChatCompletion(messages);
-};
-
-const handledConnectionIssue = (type) => {
-  switch (type) {
-    case 'auth':
-      return 'Se detectó un problema de autenticación (401).';
-    case 'quota':
-      return 'Se detectaron límites o cuotas (403/429).';
-    case 'network':
-      return 'Se detectó un problema de red/DNS.';
-    default:
-      return 'Se detectó un fallo en el autodiagnóstico inicial.';
-  }
-};
-
-let fallbackMode = false;
-let fallbackReason = null;
-
-const activateFallback = (reason) => {
-  if (fallbackMode) return;
-  fallbackMode = true;
-  fallbackReason = reason;
-  console.warn('Activando modo fallback local: %s', reason);
-};
-
-const runStartupSelfCheck = async () => {
-  try {
-    const result = await runSelfCheck({ silent: true });
-    if (!result.ok) {
-      activateFallback(handledConnectionIssue(result.type));
-      console.error('[Selfcheck] %s', result.message);
-    } else {
-      console.log('[Selfcheck] Conexión verificada. Modelos detectados:', result.models.join(', ') || 'no especificados');
-    }
-  } catch (error) {
-    activateFallback('Se detectó un error inesperado en el autodiagnóstico inicial.');
-    console.error('[Selfcheck] Error inesperado.', error);
-  }
-};
-
-await runStartupSelfCheck();
-
-async function sendFallbackTechnicalIssue(sock, chatId) {
-  await sendTextHuman(
-    sock,
-    chatId,
-    'Estoy con inconvenientes técnicos temporales. ¿Te parece si vuelvo a intentar en un minuto?',
-    1200
-  );
-}
-
-// Utilidad para obtener el texto sin importar el tipo de mensaje recibido
-const getMessageText = (message = {}) => {
+function extractText(message = {}) {
   if (message.conversation) return message.conversation;
   if (message.extendedTextMessage?.text) return message.extendedTextMessage.text;
   if (message.imageMessage?.caption) return message.imageMessage.caption;
   if (message.videoMessage?.caption) return message.videoMessage.caption;
+  if (message.buttonsResponseMessage?.selectedDisplayText) {
+    return message.buttonsResponseMessage.selectedDisplayText;
+  }
+  if (message.listResponseMessage?.title) {
+    return message.listResponseMessage.title;
+  }
   return null;
-};
+}
 
-// Inicializa la conexión, gestiona el QR y controla los eventos del socket
-const startBot = async () => {
+async function sendMessageWithGap(sock, jid, text) {
+  const now = Date.now();
+  const last = lastSentAt.get(jid) || 0;
+  const wait = Math.max(0, MIN_SEND_GAP_MS - (now - last));
+  if (wait > 0) {
+    await sleep(wait);
+  }
+
+  await sock.sendMessage(jid, { text });
+  lastSentAt.set(jid, Date.now());
+}
+
+function startTypingIndicator(sock, jid) {
+  let stopped = false;
+
+  const pushTyping = async () => {
+    try {
+      await sock.sendPresenceUpdate('composing', jid);
+    } catch (error) {
+      console.warn('No se pudo enviar el indicador de escritura:', error);
+    }
+  };
+
+  void pushTyping();
+  const interval = setInterval(() => {
+    if (!stopped) {
+      void pushTyping();
+    }
+  }, 7_000);
+  interval.unref?.();
+
+  return async () => {
+    stopped = true;
+    clearInterval(interval);
+    try {
+      await sock.sendPresenceUpdate('paused', jid);
+    } catch (error) {
+      console.warn('No se pudo pausar el indicador de escritura:', error);
+    }
+  };
+}
+
+function isRateLimited(chatId) {
+  const last = rateLimitWindow.get(chatId) || 0;
+  return Date.now() - last < RATE_LIMIT_WINDOW_MS;
+}
+
+function markRateLimit(chatId) {
+  rateLimitWindow.set(chatId, Date.now());
+}
+
+async function maybeWarnRateLimit(sock, chatId) {
+  const now = Date.now();
+  const lastWarn = rateLimitWarnedAt.get(chatId) || 0;
+  if (now - lastWarn < RATE_LIMIT_WINDOW_MS) return;
+  rateLimitWarnedAt.set(chatId, now);
+  await sendMessageWithGap(sock, chatId, RATE_LIMIT_REPLY);
+}
+
+async function handleCommand({ sock, chatId, command, messageTimestamp }) {
+  if (command === '/ping') {
+    const messageMs = Number(messageTimestamp || 0) * 1000;
+    const latency = messageMs ? Math.max(0, Date.now() - messageMs) : 0;
+    const reply = latency ? `pong 🏓 (${latency} ms)` : 'pong 🏓';
+    await sendMessageWithGap(sock, chatId, reply);
+    return;
+  }
+
+  if (command === '/reset') {
+    resetChatMemory(chatId);
+    await sendMessageWithGap(sock, chatId, 'Memoria del chat reiniciada.');
+    return;
+  }
+
+  await sendMessageWithGap(sock, chatId, 'Comando no reconocido. Usa /ping o /reset.');
+}
+
+async function handleIncomingMessage({ sock, message }) {
+  const { key, message: content, messageTimestamp } = message;
+  if (!key || key.fromMe) return;
+
+  const chatId = key.remoteJid;
+  if (!chatId || chatId === 'status@broadcast') return;
+
+  if (processedMessageIds.has(key.id)) return;
+  // FIX: Evitamos responder dos veces al mismo mensaje y romper bucles de eco.
+  markMessageProcessed(key.id);
+
+  const rawText = extractText(content);
+  if (!rawText) return;
+
+  const text = rawText.trim();
+  if (!text) return;
+
+  const lower = text.toLowerCase();
+
+  if (lower.startsWith(COMMAND_PREFIX)) {
+    markRateLimit(chatId);
+    await handleCommand({ sock, chatId, command: lower.split(/\s+/)[0], messageTimestamp });
+    return;
+  }
+
+  if (isRateLimited(chatId)) {
+    await maybeWarnRateLimit(sock, chatId);
+    return;
+  }
+
+  markRateLimit(chatId);
+
+  const stopTyping = startTypingIndicator(sock, chatId);
+  try {
+    const reply = await askLLM(text, { systemPrompt: SYSTEM_PROMPT, chatId });
+    await sendMessageWithGap(sock, chatId, reply);
+  } catch (error) {
+    // FIX: Registro centralizado de errores de Groq con fallback amigable.
+    console.error('Error al consultar Groq:', error);
+    await sendMessageWithGap(sock, chatId, FALLBACK_REPLY);
+  } finally {
+    await stopTyping();
+    markRateLimit(chatId);
+  }
+}
+
+async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -374,108 +208,36 @@ const startBot = async () => {
 
     if (connection === 'open') {
       console.log('Bot conectado correctamente.');
-      if (fallbackMode && fallbackReason) {
-        console.warn('Modo fallback activo: %s', fallbackReason);
-      }
     }
 
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-
       if (shouldReconnect) {
-        console.log('La conexión se cerró. Intentando reconectar automáticamente...');
-        startBot();
+        console.log('La conexión se cerró. Intentando reconectar...');
+        setTimeout(() => {
+          startBot().catch((error) => console.error('Error al reconectar el bot:', error));
+        }, 2_000).unref?.();
       } else {
-        console.log('La sesión se cerró de forma permanente. Borra la carpeta auth_state para iniciar nuevamente.');
+        console.log('La sesión se cerró de forma permanente. Elimina auth_state para reautenticar.');
       }
     }
   });
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
-    const m = messages?.[0];
-    if (!m || m.key.fromMe) return;
+    const [message] = messages || [];
+    if (!message) return;
 
-    const from = m.key.remoteJid;
-    if (!from || from === 'status@broadcast') return;
-
-    const id = m.key.id;
-    if (!id || handled.has(id)) return;
-    handled.add(id);
-    setTimeout(() => handled.delete(id), 60_000);
-
-    const text = getMessageText(m.message) ?? '';
-    if (!text) return;
-
-    const normalized = text.trim();
-    if (!normalized) return;
-
-    const lower = normalized.toLowerCase();
     try {
-      if (!lower.startsWith(COMMAND_PREFIX)) {
-        const contactName = (m.pushName ?? '').trim();
-
-        const reply = await responderIA({ contactName, text: normalized });
-        await sendTextHuman(sock, from, reply, 1800);
-        return;
-      }
-
-      const cmd = lower.split(/\s+/)[0];
-
-      if (cmd === '/cmds') {
-        const menu = [
-          'Comandos disponibles:',
-          '• /precios',
-          '• /soporte',
-          '• /info'
-        ].join('\n');
-        await sendTextHuman(sock, from, menu, 1800);
-        return;
-      }
-
-      if (cmd === '/precios') {
-        await sendTextHuman(sock, from, 'Planes desde $99/mes con soporte premium incluido.', 1500);
-        return;
-      }
-
-      if (cmd === '/soporte') {
-        await sendTextHuman(sock, from, 'Contacta a soporte. Deja tu mensaje y te respondemos en breve.', 1700);
-        return;
-      }
-
-      if (cmd === '/info') {
-        await sendTextHuman(sock, from, 'Bot con Baileys y Node.js (demo).', 1400);
-        return;
-      }
-
-      await sendTextHuman(sock, from, 'Comando no reconocido. Usa /cmds', 1600);
+      await handleIncomingMessage({ sock, message });
     } catch (error) {
-      const normalizedError = normalizeOpenAIError(error);
-      console.error('Error al procesar un mensaje:', {
-        status: normalizedError.status,
-        code: normalizedError.code,
-        message: normalizedError.message
-      });
-
-      if (normalizedError.status === 401) {
-        console.warn('Detalle: Token inválido o expirado (401).');
-        activateFallback(handledConnectionIssue('auth'));
-      } else if (normalizedError.status === 403 || normalizedError.status === 429) {
-        console.warn('Detalle: Restricción o cuota (status %s).', normalizedError.status);
-        activateFallback(handledConnectionIssue('quota'));
-      } else if (NETWORK_ERROR_CODES.has(normalizedError.code)) {
-        console.warn('Detalle: Posible problema de red (%s).', normalizedError.code);
-        activateFallback(handledConnectionIssue('network'));
-      } else if (normalizedError.code === 'config') {
-        activateFallback('Configuración incompleta del cliente OpenAI.');
-      }
-
-      await sendFallbackTechnicalIssue(sock, from);
+      console.error('Error no controlado al procesar un mensaje:', error);
     }
   });
-};
 
-// Punto de entrada principal del script
+  return sock;
+}
+
 startBot().catch((error) => {
   console.error('No fue posible iniciar el bot:', error);
 });
