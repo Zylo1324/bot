@@ -24,11 +24,27 @@ const AUTH_FOLDER = './auth_state';
 const COMMAND_PREFIX = '/';
 const FALLBACK_REPLY = 'Ahora mismo no puedo responder, inténtalo otra vez.';
 const RATE_LIMIT_REPLY = 'Estoy procesando tu mensaje, dame un segundo 🙏';
-const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT?.trim() || 'Eres un asistente útil, amable y preciso. Responde en español.';
+const DEFAULT_SYSTEM_PROMPT = `
+Eres el asistente comercial oficial de un servicio premium. Siempre responde en español siguiendo estas reglas estrictas:
+
+1. Tono: profesional, amable y persuasivo.
+2. Formato: cada turno debe contener entre 2 y 4 mensajes, máximo 40 palabras cada uno.
+3. Delimitador: entrega los mensajes en una sola respuesta separados por "||" (doble barra vertical). No uses "||" dentro de los mensajes.
+4. Pausas humanas: el sistema añadirá esperas de 800 a 2000 ms entre mensajes; escribe pensando en ese ritmo.
+5. Nombres: si el usuario comparte su nombre, incluye exactamente "Genial {Nombre}, ¿cómo puedo ayudarte?" en el siguiente turno. Si aún no da su nombre, pregunta literalmente "¿Cómo te llamo para agendarte?".
+6. Descubre primero qué necesita (IA, streaming o académico) antes de ofrecer. Haz preguntas breves para identificarlo.
+7. Si pregunta "¿Qué es ChatGPT?", ofrece una explicación corta y dirige enseguida hacia la compra del servicio adecuado.
+8. Si pregunta por otros servicios como Perplexity o Canva, da una frase breve y finaliza con: "Genial, puedo ofrecerte ese servicio. ¿Deseas adquirirlo?".
+
+Cumple siempre estas reglas y evita información irrelevante.
+`;
+const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT?.trim() || DEFAULT_SYSTEM_PROMPT;
 
 const MIN_SEND_GAP_MS = 1_200;
 const RATE_LIMIT_WINDOW_MS = 2_000;
 const MESSAGE_CACHE_TTL_MS = 5 * 60_000;
+const HUMAN_PAUSE_MIN_MS = 800;
+const HUMAN_PAUSE_MAX_MS = 2_000;
 
 const processedMessageIds = new Set();
 const lastSentAt = new Map();
@@ -36,6 +52,19 @@ const rateLimitWindow = new Map();
 const rateLimitWarnedAt = new Map();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const randomHumanPause = () => {
+  const range = HUMAN_PAUSE_MAX_MS - HUMAN_PAUSE_MIN_MS;
+  return HUMAN_PAUSE_MIN_MS + Math.floor(Math.random() * (range + 1));
+};
+
+function splitAssistantMessages(raw) {
+  if (typeof raw !== 'string') return [];
+  return raw
+    .split('||')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+}
 
 function scheduleMessageCleanup(id) {
   if (!id) return;
@@ -175,7 +204,13 @@ async function handleIncomingMessage({ sock, message }) {
   const stopTyping = startTypingIndicator(sock, chatId);
   try {
     const reply = await askLLM(text, { systemPrompt: SYSTEM_PROMPT, chatId });
-    await sendMessageWithGap(sock, chatId, reply);
+    const messages = splitAssistantMessages(reply);
+    const queue = messages.length > 0 ? messages : [reply];
+
+    for (const messageText of queue) {
+      await sleep(randomHumanPause());
+      await sendMessageWithGap(sock, chatId, messageText);
+    }
   } catch (error) {
     // FIX: Registro centralizado de errores de Groq con fallback amigable.
     console.error('Error al consultar Groq:', error);
