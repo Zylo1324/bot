@@ -1,0 +1,8 @@
+{
+  "name": "dotenv",
+  "version": "0.0.0-local",
+  "type": "module",
+  "exports": {
+    "./config": "./config.js"
+  }
+}

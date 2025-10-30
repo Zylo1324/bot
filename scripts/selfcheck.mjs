@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import 'dotenv/config';
 import process from 'node:process';
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -6,9 +7,9 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const normalizeBaseUrl = (value = '') => value.replace(/\/$/, '');
 
 const classifyStatus = (status) => {
-  if (status === 401) return { type: 'auth', message: 'Token inválido o expirado. Regenera en AgentRouter.' };
+  if (status === 401) return { type: 'auth', message: 'Token inválido o expirado. Regenera la clave en Groq.' };
   if (status === 403 || status === 429) {
-    return { type: 'quota', message: 'Restricción o cuota. Revisa el panel.' };
+    return { type: 'quota', message: 'Restricción o cuota activa en Groq. Revisa el panel.' };
   }
   if (status >= 500) {
     return { type: 'server', message: 'Error temporal del servicio. Intenta nuevamente en unos minutos.' };
@@ -23,19 +24,19 @@ export async function runSelfCheck({ silent = false } = {}) {
     }
   };
 
-  const apiKey = process.env.OPENAI_API_KEY;
-  const baseUrl = process.env.OPENAI_BASE_URL;
+  const apiKey = process.env.GROQ_API_KEY;
+  const baseUrl = process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1';
 
   if (!apiKey || !baseUrl) {
     const missing = [];
-    if (!apiKey) missing.push('OPENAI_API_KEY');
-    if (!baseUrl) missing.push('OPENAI_BASE_URL');
+    if (!apiKey) missing.push('GROQ_API_KEY');
+    if (!baseUrl) missing.push('GROQ_BASE_URL');
     const message = `Faltan variables de entorno: ${missing.join(', ')}.`;
     log(message);
     return { ok: false, type: 'missing_env', message };
   }
 
-  const endpoint = `${normalizeBaseUrl(baseUrl)}/v1/models`;
+  const endpoint = `${normalizeBaseUrl(baseUrl)}/models`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
 
@@ -87,7 +88,7 @@ export async function runSelfCheck({ silent = false } = {}) {
       return { ok: false, type: 'network', code, message };
     }
 
-    const message = 'Error inesperado al consultar /v1/models.';
+    const message = 'Error inesperado al consultar el endpoint de modelos.';
     if (!silent) {
       console.error(message, error);
     }
