@@ -5,6 +5,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   useMultiFileAuthState
 } from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
 
 import { askLLM, resetChatMemory, hasChatHistory } from './lib/groq.js';
@@ -995,7 +996,7 @@ async function startBot() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -1005,19 +1006,28 @@ async function startBot() {
 
     if (connection === 'open') {
       console.log('Bot conectado correctamente.');
+      return;
     }
 
     if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      if (shouldReconnect) {
-        console.log('La conexión se cerró. Intentando reconectar...');
-        setTimeout(() => {
-          startBot().catch((error) => console.error('Error al reconectar el bot:', error));
-        }, 2_000).unref?.();
-      } else {
+      const error = lastDisconnect?.error;
+      const statusCode =
+        error && error instanceof Boom ? error.output?.statusCode : lastDisconnect?.error?.output?.statusCode;
+
+      if (statusCode === DisconnectReason.loggedOut) {
         console.log('La sesión se cerró de forma permanente. Elimina auth_state para reautenticar.');
+        return;
       }
+
+      if (statusCode === 515) {
+        console.log('🌀 Reinicio requerido (515). Esperando 5s antes de reintentar...');
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+      } else {
+        console.log('⚠️ Desconexión detectada. Reintentando...');
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+      }
+
+      startBot().catch((error) => console.error('Error al reconectar el bot:', error));
     }
   });
 
