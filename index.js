@@ -25,7 +25,7 @@ if (missingEnv.length > 0) {
 }
 
 // --- helpers ---
-const queue = new PQueue({ concurrency: 3 });
+const queue = new PQueue({ concurrency: 1 });
 const burstBuffer = new Map(); // chatId -> { texts: [], timer: NodeJS.Timeout }
 
 function getName(message) {
@@ -37,7 +37,40 @@ function getName(message) {
 }
 
 function toMarkdownBlocks(text) {
-  return text.replace(/\n{3,}/g, '\n\n').trim();
+  const raw = typeof text === 'string' ? text : String(text ?? '');
+  const normalized = raw.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  if (!normalized) return '';
+
+  const paragraphs = normalized
+    .split(/\n{2,}/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+
+  const formatted = paragraphs.map((block) => {
+    const lines = block
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (lines.length <= 1) {
+      return lines[0] || '';
+    }
+
+    const looksLikeList = lines.every((line) => /^[*•\-]\s/.test(line));
+    if (looksLikeList) {
+      return lines
+        .map((line) => line.replace(/^[*•\-]\s*/, '• ').trim())
+        .join('\n');
+    }
+
+    return lines
+      .map((line) => line.replace(/^[*•\-]\s*/, '').trim())
+      .filter(Boolean)
+      .map((line) => `• ${line}`)
+      .join('\n');
+  });
+
+  return formatted.filter(Boolean).join('\n\n');
 }
 
 function varyPrefix(name) {
