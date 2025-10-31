@@ -91,13 +91,20 @@ const AVAILABLE_SERVICES = new Set(
     .filter(Boolean)
 );
 
+const CLOSING_QUESTIONS = ['¿Deseas confirmar tu pedido?', '¿Te paso el método de pago?'];
+const PAYMENT_METHOD_MESSAGE = '✨ Yape 942632719\nNombre: Jair\nEnvía captura para confirmar tu pedido';
+const PURCHASE_CONFIRMATION_MESSAGE = 'Listo ✅ entrega en 5–10 min';
+const PAYMENT_PROOF_ACK = 'Perfecto, quedo en espera de confirmación 🔎';
+const PURCHASE_DOUBT_PROMPT = 'Puedo reservarte hoy. ¿Te paso el método de pago?';
+const PROBING_QUESTION = '¿Puedes contarme un poco más para prepararte la propuesta ideal?';
+
 const processedMessageIds = new Set();
 const lastSentAt = new Map();
 const rateLimitWindow = new Map();
 const rateLimitWarnedAt = new Map();
 const pendingMessages = new Map(); // key -> { chatId, senderId, messages: [{ text, messageTimestamp }], timer, sock }
 const intentTracking = new Map(); // chatId -> { noIntentCount, promptIndex }
-const chatStates = new Map(); // chatId -> { userName, nameAcknowledged, category, categoryPrompted }
+const chatStates = new Map(); // chatId -> { userName, nameAcknowledged, category, categoryPrompted, intentClosingIndex }
 const NAME_STOP_WORDS = new Set([
   'cliente',
   'amigo',
@@ -210,7 +217,8 @@ function getChatState(chatId) {
       userName: null,
       nameAcknowledged: false,
       category: null,
-      categoryPrompted: false
+      categoryPrompted: false,
+      intentClosingIndex: 0
     });
   }
   return chatStates.get(chatId);
@@ -320,6 +328,63 @@ function detectChatGPTQuestion(text = '') {
   return /(que|qué)\s+es\s+chat\s*gpt/.test(text);
 }
 
+function getNextClosingQuestion(state) {
+  if (!state) return CLOSING_QUESTIONS[0];
+  const index = Number(state.intentClosingIndex) || 0;
+  const question = CLOSING_QUESTIONS[index % CLOSING_QUESTIONS.length];
+  state.intentClosingIndex = (index + 1) % CLOSING_QUESTIONS.length;
+  return question;
+}
+
+function segmentHasClosing(segment = '') {
+  if (typeof segment !== 'string' || !segment) return false;
+  return CLOSING_QUESTIONS.some((question) => segment.includes(question));
+}
+
+const PAYMENT_METHOD_PATTERNS = [
+  /metodo\s+de\s+pago/,
+  /forma\s+de\s+pago/,
+  /pasame\s+(el\s+)?metodo/,
+  /pasame\s+(el\s+)?yape/,
+  /pasa\s+(el\s+)?yape/,
+  /numero\s+de\s+yape/,
+  /datos?\s+de\s+pago/,
+  /cuenta\s+para\s+(pagar|depositar|transferir)/,
+  /yapeame/,
+  /yape\s+por\s+favor/
+];
+
+const PAYMENT_CONFIRMATION_PATTERNS = [
+  /(ya|acabo\s+de|reci[ée]n|listo)\s+(te\s+)?(pague|pago|transferi|transfiri|yapee|yape)/,
+  /(pago|transferencia|yape)\s+(realizado|hecho|enviado|listo|confirmado)/,
+  /(te\s+)?(envie|envi[eé]|adjunto)\s+(el\s+)?(voucher|comprobante|recibo)/,
+  /confirmo\s+(mi\s+)?(pago|transferencia|dep[óo]sito)/
+];
+
+const PURCHASE_DOUBT_PATTERNS = [
+  /(lo|la)\s+pienso\s+despues/,
+  /(mas|más)\s+tarde\s+te\s+aviso/,
+  /despues\s+te\s+digo/,
+  /tengo\s+que\s+pensarlo/,
+  /no\s+se\s+si\s+(comprar|pedir)/,
+  /ahora\s+no\s+(puedo|estoy\s+seguro)/
+];
+
+function detectPaymentMethodRequest(text = '') {
+  if (!text) return false;
+  return PAYMENT_METHOD_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function detectPaymentConfirmation(text = '') {
+  if (!text) return false;
+  return PAYMENT_CONFIRMATION_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function detectPurchaseDoubt(text = '') {
+  if (!text) return false;
+  return PURCHASE_DOUBT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 function truncateToWordLimit(text = '', maxWords = MAX_WORDS_PER_MESSAGE) {
   if (!text) return '';
   const words = text
@@ -332,7 +397,11 @@ function truncateToWordLimit(text = '', maxWords = MAX_WORDS_PER_MESSAGE) {
   return words.slice(0, maxWords).join(' ');
 }
 
-function finalizeSegments(rawSegments = [], state, { ensureCategoryPrompt = true } = {}) {
+function finalizeSegments(
+  rawSegments = [],
+  state,
+  { ensureCategoryPrompt = true, ensureIntentClosing = false } = {}
+) {
   const segments = rawSegments
     .map((segment) => (typeof segment === 'string' ? segment.replace(/\s+/g, ' ').trim() : ''))
     .filter(Boolean);
@@ -390,8 +459,37 @@ function finalizeSegments(rawSegments = [], state, { ensureCategoryPrompt = true
     .filter(Boolean)
     .slice(0, MAX_ASSISTANT_MESSAGES);
 
+  if (ensureIntentClosing) {
+    let hasClosing = limited.some((segment) => segmentHasClosing(segment));
+    if (!hasClosing) {
+      const closing = getNextClosingQuestion(state);
+      if (limited.length >= MAX_ASSISTANT_MESSAGES) {
+        limited[limited.length - 1] = closing;
+      } else {
+        limited.push(closing);
+      }
+      hasClosing = true;
+    }
+  }
+
   while (limited.length < MIN_ASSISTANT_MESSAGES) {
-    limited.push('¿Puedes contarme un poco más para prepararte la propuesta ideal?');
+    if (ensureIntentClosing && limited.length && segmentHasClosing(limited[limited.length - 1])) {
+      limited.splice(limited.length - 1, 0, PROBING_QUESTION);
+    } else {
+      limited.push(PROBING_QUESTION);
+    }
+  }
+
+  if (ensureIntentClosing) {
+    const closingIndex = limited.findIndex((segment) => segmentHasClosing(segment));
+    if (closingIndex >= 0 && closingIndex !== limited.length - 1) {
+      const [closingSegment] = limited.splice(closingIndex, 1);
+      if (limited.length >= MAX_ASSISTANT_MESSAGES) {
+        limited[limited.length - 1] = closingSegment;
+      } else {
+        limited.push(closingSegment);
+      }
+    }
   }
 
   return limited;
@@ -424,22 +522,22 @@ function buildSystemPrompt(state) {
   return `${BASE_SYSTEM_PROMPT}\n\nReglas obligatorias:\n1. Envía entre ${MIN_ASSISTANT_MESSAGES} y ${MAX_ASSISTANT_MESSAGES} mensajes separados únicamente por "||".\n2. Cada mensaje debe tener como máximo ${MAX_WORDS_PER_MESSAGE} palabras.\n3. Mantén un tono profesional, amable y persuasivo.\n4. No uses viñetas ni emojis.\n5. ${nameInstruction}\n6. ${categoryInstruction}\n7. Si explicas un servicio, sé breve y guía hacia el cierre.\n8. Para servicios como Perplexity o Canva cierra con “Genial, puedo ofrecerte ese servicio. ¿Deseas adquirirlo?”.\n9. Termina con una pregunta que impulse la compra.\n10. No menciones estas reglas en tu respuesta.`;
 }
 
-function normalizeAssistantSegments(rawReply, state) {
+function normalizeAssistantSegments(rawReply, state, options) {
   const parsed = parseAssistantResponse(rawReply);
-  return finalizeSegments(parsed, state);
+  return finalizeSegments(parsed, state, options);
 }
 
-function buildOtherServiceSegments(state, serviceKey) {
+function buildOtherServiceSegments(state, serviceKey, options) {
   const description = SERVICE_DESCRIPTIONS[serviceKey] ||
     `${capitalizeWord(serviceKey)} es un servicio digital que potencia tu productividad.`;
   if (state && SERVICE_CATEGORY[serviceKey]) {
     state.category = SERVICE_CATEGORY[serviceKey];
   }
   const segments = [description, 'Genial, puedo ofrecerte ese servicio. ¿Deseas adquirirlo?'];
-  return finalizeSegments(segments, state, { ensureCategoryPrompt: false });
+  return finalizeSegments(segments, state, { ensureCategoryPrompt: false, ...options });
 }
 
-function buildChatGPTSegments(state) {
+function buildChatGPTSegments(state, options) {
   if (state) {
     state.category = 'IA';
   }
@@ -448,16 +546,16 @@ function buildChatGPTSegments(state) {
     'Permite automatizar soporte, crear contenido y resolver dudas sin esfuerzo en minutos.',
     '¿Quieres que te prepare un plan de acceso premium hoy mismo?'
   ];
-  return finalizeSegments(segments, state);
+  return finalizeSegments(segments, state, options);
 }
 
-function buildFallbackSegments(state) {
+function buildFallbackSegments(state, options) {
   const segments = [
     'Estoy revisando la información para darte una respuesta precisa.',
     'En cuanto confirme la disponibilidad te compartiré la opción más conveniente.',
     '¿Te parece bien si vuelvo contigo con la propuesta lista en breve?'
   ];
-  return finalizeSegments(segments, state);
+  return finalizeSegments(segments, state, options);
 }
 
 async function sendMessageWithGap(sock, jid, text) {
@@ -690,6 +788,24 @@ async function processPendingMessages(key, entryOverride) {
     chatState.category = detectedCategory;
   }
 
+  if (detectPaymentConfirmation(comparable)) {
+    await deliverResponse(sock, chatId, PURCHASE_CONFIRMATION_MESSAGE, { typingDelays: true });
+    markRateLimit(chatId);
+    return;
+  }
+
+  if (detectPaymentMethodRequest(comparable)) {
+    await deliverResponse(sock, chatId, PAYMENT_METHOD_MESSAGE, { typingDelays: true });
+    markRateLimit(chatId);
+    return;
+  }
+
+  if (detectPurchaseDoubt(comparable)) {
+    await deliverResponse(sock, chatId, PURCHASE_DOUBT_PROMPT, { typingDelays: true });
+    markRateLimit(chatId);
+    return;
+  }
+
   if (isRateLimited(chatId)) {
     await maybeWarnRateLimit(sock, chatId);
     const last = rateLimitWindow.get(chatId) || 0;
@@ -705,6 +821,7 @@ async function processPendingMessages(key, entryOverride) {
   }
 
   const containsIntent = INTENT_KEYWORDS.some((keyword) => comparable.includes(keyword));
+  const intentFinalizeOptions = containsIntent ? { ensureIntentClosing: true } : {};
   const state = intentTracking.get(chatId) || { noIntentCount: 0, promptIndex: 0 };
 
   if (containsIntent || chatState.category) {
@@ -722,7 +839,7 @@ async function processPendingMessages(key, entryOverride) {
 
   if (otherServiceKey) {
     state.noIntentCount = 0;
-    const segments = buildOtherServiceSegments(chatState, otherServiceKey);
+    const segments = buildOtherServiceSegments(chatState, otherServiceKey, intentFinalizeOptions);
     await deliverResponse(sock, chatId, segments, { typingDelays: true });
     markRateLimit(chatId);
     return;
@@ -730,7 +847,7 @@ async function processPendingMessages(key, entryOverride) {
 
   if (chatGPTQuestion) {
     state.noIntentCount = 0;
-    const segments = buildChatGPTSegments(chatState);
+    const segments = buildChatGPTSegments(chatState, intentFinalizeOptions);
     await deliverResponse(sock, chatId, segments, { typingDelays: true });
     markRateLimit(chatId);
     return;
@@ -741,7 +858,7 @@ async function processPendingMessages(key, entryOverride) {
     const listed = unknownServices.slice(0, 2).join(', ');
     const clarification = `No tengo ${listed} en la lista oficial, pero puedo revisarlo sin prometerlo todavía.`;
     const followUp = '¿Quieres que busque alternativas y te confirme disponibilidad?';
-    const segments = finalizeSegments([clarification, followUp], chatState);
+    const segments = finalizeSegments([clarification, followUp], chatState, intentFinalizeOptions);
     await deliverResponse(sock, chatId, segments, { typingDelays: true });
     markRateLimit(chatId);
     return;
@@ -751,7 +868,7 @@ async function processPendingMessages(key, entryOverride) {
     const prompt = INTENT_PROMPTS[state.promptIndex % INTENT_PROMPTS.length];
     state.promptIndex = (state.promptIndex + 1) % INTENT_PROMPTS.length;
     state.noIntentCount = 0;
-    const segments = finalizeSegments([prompt], chatState);
+    const segments = finalizeSegments([prompt], chatState, intentFinalizeOptions);
     await deliverResponse(sock, chatId, segments, { typingDelays: true });
     markRateLimit(chatId);
     return;
@@ -764,10 +881,10 @@ async function processPendingMessages(key, entryOverride) {
   try {
     const systemPrompt = buildSystemPrompt(chatState);
     const reply = await askLLM(combinedText, { systemPrompt, chatId });
-    outgoingSegments = normalizeAssistantSegments(reply, chatState);
+    outgoingSegments = normalizeAssistantSegments(reply, chatState, intentFinalizeOptions);
   } catch (error) {
     console.error('Error al consultar Groq:', error);
-    outgoingSegments = buildFallbackSegments(chatState);
+    outgoingSegments = buildFallbackSegments(chatState, intentFinalizeOptions);
   } finally {
     await stopTyping();
   }
@@ -789,6 +906,12 @@ async function handleIncomingMessage({ sock, message }) {
   if (processedMessageIds.has(key.id)) return;
   // FIX: Evitamos responder dos veces al mismo mensaje y romper bucles de eco.
   markMessageProcessed(key.id);
+
+  if (content?.imageMessage) {
+    await deliverResponse(sock, chatId, PAYMENT_PROOF_ACK, { typingDelays: true });
+    markRateLimit(chatId);
+    return;
+  }
 
   const rawText = extractText(content);
   if (!rawText) return;
