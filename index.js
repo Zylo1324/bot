@@ -64,7 +64,7 @@ const processedMessageIds = new Set();
 const lastSentAt = new Map();
 const rateLimitWindow = new Map();
 const rateLimitWarnedAt = new Map();
-const pendingMessages = new Map(); // chatId -> { messages: [{ text, messageTimestamp }], timer, sock }
+const pendingMessages = new Map(); // key -> { chatId, senderId, messages: [{ text, messageTimestamp }], timer, sock }
 const intentTracking = new Map(); // chatId -> { noIntentCount, promptIndex }
 const greetedChats = new Set();
 
@@ -185,11 +185,13 @@ async function handleCommand({ sock, chatId, command, messageTimestamp }) {
   if (command === '/reset') {
     resetChatMemory(chatId);
     greetedChats.delete(chatId);
-    const pending = pendingMessages.get(chatId);
-    if (pending?.timer) {
-      clearTimeout(pending.timer);
+    for (const [key, entry] of pendingMessages.entries()) {
+      if (entry.chatId !== chatId) continue;
+      if (entry.timer) {
+        clearTimeout(entry.timer);
+      }
+      pendingMessages.delete(key);
     }
-    pendingMessages.delete(chatId);
     intentTracking.delete(chatId);
     await deliverResponse(sock, chatId, 'Memoria del chat reiniciada.', { skipGreeting: true });
     markRateLimit(chatId);
@@ -200,10 +202,35 @@ async function handleCommand({ sock, chatId, command, messageTimestamp }) {
   markRateLimit(chatId);
 }
 
-function queuePendingMessage({ chatId, text, messageTimestamp, sock }) {
+function buildPendingKey(chatId, senderId) {
+  return `${chatId}::${senderId || chatId}`;
+}
+
+function queuePendingMessage({ chatId, senderId, text, messageTimestamp, sock }) {
   if (!text) return;
 
-  const entry = pendingMessages.get(chatId) || { messages: [], timer: null, sock };
+  const normalizedSender = senderId || chatId;
+  const key = buildPendingKey(chatId, normalizedSender);
+  for (const [existingKey, pending] of [...pendingMessages.entries()]) {
+    if (pending.chatId !== chatId) continue;
+    if (pending.senderId === normalizedSender) continue;
+    if (pending.timer) {
+      clearTimeout(pending.timer);
+      pending.timer = null;
+    }
+    pendingMessages.delete(existingKey);
+    void processPendingMessages(existingKey, pending);
+  }
+  const entry = pendingMessages.get(key) || {
+    chatId,
+    senderId: normalizedSender,
+    messages: [],
+    timer: null,
+    sock
+  };
+
+  entry.chatId = chatId;
+  entry.senderId = normalizedSender;
   entry.messages.push({ text, messageTimestamp });
   entry.sock = sock;
 
@@ -213,11 +240,11 @@ function queuePendingMessage({ chatId, text, messageTimestamp, sock }) {
 
   entry.timer = setTimeout(() => {
     entry.timer = null;
-    void processPendingMessages(chatId);
+    void processPendingMessages(key);
   }, MESSAGE_INACTIVITY_TIMEOUT_MS);
   entry.timer.unref?.();
 
-  pendingMessages.set(chatId, entry);
+  pendingMessages.set(key, entry);
 }
 
 function findUnknownServices(lowerText) {
@@ -240,16 +267,20 @@ function findUnknownServices(lowerText) {
   return [...unknownServices];
 }
 
-async function processPendingMessages(chatId) {
-  const entry = pendingMessages.get(chatId);
+async function processPendingMessages(key, entryOverride) {
+  const entry = entryOverride ?? pendingMessages.get(key);
   if (!entry) return;
 
-  pendingMessages.delete(chatId);
+  if (!entryOverride) {
+    pendingMessages.delete(key);
+  } else if (pendingMessages.get(key) === entry) {
+    pendingMessages.delete(key);
+  }
   if (entry.timer) {
     clearTimeout(entry.timer);
   }
 
-  const { messages, sock } = entry;
+  const { chatId, messages, sock } = entry;
   if (!sock || !messages.length) return;
 
   const combinedText = messages
@@ -267,12 +298,12 @@ async function processPendingMessages(chatId) {
     const last = rateLimitWindow.get(chatId) || 0;
     const elapsed = Date.now() - last;
     const wait = Math.max(250, RATE_LIMIT_WINDOW_MS - elapsed);
+    pendingMessages.set(key, entry);
     entry.timer = setTimeout(() => {
       entry.timer = null;
-      void processPendingMessages(chatId);
+      void processPendingMessages(key);
     }, wait);
     entry.timer.unref?.();
-    pendingMessages.set(chatId, entry);
     return;
   }
 
@@ -347,7 +378,8 @@ async function handleIncomingMessage({ sock, message }) {
     return;
   }
 
-  queuePendingMessage({ chatId, text, messageTimestamp, sock });
+  const senderId = key.participant || chatId;
+  queuePendingMessage({ chatId, senderId, text, messageTimestamp, sock });
 }
 
 async function startBot() {
