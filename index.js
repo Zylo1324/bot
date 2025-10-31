@@ -7,7 +7,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
 
-import { askLLM, resetChatMemory } from './lib/groq.js';
+import { askLLM, resetChatMemory, hasChatHistory } from './lib/groq.js';
 
 const REQUIRED_ENV = ['GROQ_API_KEY'];
 const missingEnv = REQUIRED_ENV.filter((key) => {
@@ -77,11 +77,14 @@ const RAW_INTENT_KEYWORDS = process.env.INTENT_KEYWORDS
       'premium',
       'confirmar',
       'catálogo',
-      'catalogo'
+      'catalogo',
+      'suscripción',
+      'suscripcion',
+      'mensualidad'
     ];
 const INTENT_KEYWORDS = RAW_INTENT_KEYWORDS.map((keyword) => keyword.trim().toLowerCase()).filter(Boolean);
 const INTENT_PROMPTS = [
-  '¿Qué servicio deseas confirmar?',
+  '¿Qué servicio deseas confirmar hoy?',
   '¿Te paso el método de pago?'
 ];
 const SERVICE_MARKERS = ['servicio', 'servicios', 'cuenta', 'cuentas', 'plan', 'planes', 'activar', 'catálogo'];
@@ -219,7 +222,9 @@ function getChatState(chatId) {
       nameAcknowledged: false,
       category: null,
       categoryPrompted: false,
-      intentClosingIndex: 0
+      intentClosingIndex: 0,
+      namePrompted: false,
+      shouldGreet: true
     });
   }
   return chatStates.get(chatId);
@@ -417,10 +422,11 @@ function finalizeSegments(
       result.unshift(greeting);
     }
     state.nameAcknowledged = true;
+    state.shouldGreet = false;
   }
 
   const nameQuestion = '¿Cómo te llamo para agendarte?';
-  if (!state?.userName) {
+  if (!state?.userName && state?.shouldGreet !== false && !state?.namePrompted) {
     const alreadyAskingName = result.some((segment) => segment.includes(nameQuestion));
     if (!alreadyAskingName) {
       result.unshift(nameQuestion);
@@ -429,27 +435,36 @@ function finalizeSegments(
         result.splice(1, 1);
       }
     }
+    if (state) {
+      state.namePrompted = true;
+    }
   }
 
-  if (ensureCategoryPrompt && !state?.category) {
-    const categoryPrompt = '¿Buscas soluciones de IA, streaming o apoyo académico?';
-    const alreadyPrompted = result.some((segment) => segment.includes('IA, streaming'));
-    if (!alreadyPrompted) {
-      if (result.length >= MAX_ASSISTANT_MESSAGES) {
-        const insertIndex = Math.max(result.length - 1, 1);
-        result.splice(insertIndex, 0, categoryPrompt);
-        if (result.length > MAX_ASSISTANT_MESSAGES) {
-          result.pop();
+  if (ensureCategoryPrompt) {
+    if (!state?.category) {
+      if (!state?.categoryPrompted) {
+        const categoryPrompt = '¿Buscas soluciones de IA, streaming o apoyo académico?';
+        const alreadyPrompted = result.some((segment) => segment.includes('IA, streaming'));
+        if (!alreadyPrompted) {
+          if (result.length >= MAX_ASSISTANT_MESSAGES) {
+            const insertIndex = Math.max(result.length - 1, 1);
+            result.splice(insertIndex, 0, categoryPrompt);
+            if (result.length > MAX_ASSISTANT_MESSAGES) {
+              result.pop();
+            }
+          } else if (result.length >= 2) {
+            const insertIndex = Math.max(result.length - 1, 1);
+            result.splice(insertIndex, 0, categoryPrompt);
+          } else {
+            result.push(categoryPrompt);
+          }
         }
-      } else if (result.length >= 2) {
-        const insertIndex = Math.max(result.length - 1, 1);
-        result.splice(insertIndex, 0, categoryPrompt);
-      } else {
-        result.push(categoryPrompt);
+        if (state) {
+          state.categoryPrompted = true;
+        }
       }
-    }
-    if (state) {
-      state.categoryPrompted = true;
+    } else if (state) {
+      state.categoryPrompted = false;
     }
   } else if (state) {
     state.categoryPrompted = false;
@@ -668,6 +683,7 @@ async function maybeWarnRateLimit(sock, chatId) {
   const followUp = '¿Te parece bien si te escribo apenas tenga la respuesta lista?';
   const segments = finalizeSegments([RATE_LIMIT_REPLY, followUp], chatState);
   await deliverResponse(sock, chatId, segments, { typingDelays: true });
+  chatState.shouldGreet = false;
 }
 
 async function handleCommand({ sock, chatId, command, messageTimestamp }) {
@@ -675,7 +691,9 @@ async function handleCommand({ sock, chatId, command, messageTimestamp }) {
     const messageMs = Number(messageTimestamp || 0) * 1000;
     const latency = messageMs ? Math.max(0, Date.now() - messageMs) : 0;
     const reply = latency ? `pong 🏓 (${latency} ms)` : 'pong 🏓';
+    const chatState = getChatState(chatId);
     await deliverResponse(sock, chatId, reply, { skipGreeting: true });
+    chatState.shouldGreet = false;
     markRateLimit(chatId);
     return;
   }
@@ -691,12 +709,16 @@ async function handleCommand({ sock, chatId, command, messageTimestamp }) {
       pendingMessages.delete(key);
     }
     intentTracking.delete(chatId);
+    const chatState = getChatState(chatId);
     await deliverResponse(sock, chatId, 'Memoria del chat reiniciada.', { skipGreeting: true });
+    chatState.shouldGreet = false;
     markRateLimit(chatId);
     return;
   }
 
+  const chatState = getChatState(chatId);
   await deliverResponse(sock, chatId, 'Comando no reconocido. Usa /ping o /reset.', { skipGreeting: true });
+  chatState.shouldGreet = false;
   markRateLimit(chatId);
 }
 
@@ -792,6 +814,9 @@ async function processPendingMessages(key, entryOverride) {
   const lower = combinedText.toLowerCase();
   const comparable = toComparable(combinedText);
   const chatState = getChatState(chatId);
+  if (hasChatHistory(chatId)) {
+    chatState.shouldGreet = false;
+  }
 
   const detectedName = detectNameCandidate(combinedText);
   if (detectedName && detectedName !== chatState.userName) {
@@ -808,18 +833,21 @@ async function processPendingMessages(key, entryOverride) {
 
   if (detectPaymentConfirmation(comparable)) {
     await deliverResponse(sock, chatId, PURCHASE_CONFIRMATION_MESSAGE, { typingDelays: true });
+    chatState.shouldGreet = false;
     markRateLimit(chatId);
     return;
   }
 
   if (detectPaymentMethodRequest(comparable)) {
     await deliverResponse(sock, chatId, PAYMENT_METHOD_MESSAGE, { typingDelays: true });
+    chatState.shouldGreet = false;
     markRateLimit(chatId);
     return;
   }
 
   if (detectPurchaseDoubt(comparable)) {
     await deliverResponse(sock, chatId, PURCHASE_DOUBT_PROMPT, { typingDelays: true });
+    chatState.shouldGreet = false;
     markRateLimit(chatId);
     return;
   }
@@ -859,6 +887,7 @@ async function processPendingMessages(key, entryOverride) {
     state.noIntentCount = 0;
     const segments = buildOtherServiceSegments(chatState, otherServiceKey, intentFinalizeOptions);
     await deliverResponse(sock, chatId, segments, { typingDelays: true });
+    chatState.shouldGreet = false;
     markRateLimit(chatId);
     return;
   }
@@ -867,6 +896,7 @@ async function processPendingMessages(key, entryOverride) {
     state.noIntentCount = 0;
     const segments = buildChatGPTSegments(chatState, intentFinalizeOptions);
     await deliverResponse(sock, chatId, segments, { typingDelays: true });
+    chatState.shouldGreet = false;
     markRateLimit(chatId);
     return;
   }
@@ -874,10 +904,11 @@ async function processPendingMessages(key, entryOverride) {
   if (unknownServices.length > 0) {
     state.noIntentCount = 0;
     const listed = unknownServices.slice(0, 2).join(', ');
-    const clarification = `No tengo ${listed} en la lista oficial, pero puedo revisarlo sin prometerlo todavía.`;
-    const followUp = '¿Quieres que busque alternativas y te confirme disponibilidad?';
+    const clarification = `No tengo ${listed} en la lista oficial. Escríbeme el nombre exacto para ver si se puede conseguir sin prometerlo aún.`;
+    const followUp = '¿Te confirmo apenas tenga alguna alternativa disponible?';
     const segments = finalizeSegments([clarification, followUp], chatState, intentFinalizeOptions);
     await deliverResponse(sock, chatId, segments, { typingDelays: true });
+    chatState.shouldGreet = false;
     markRateLimit(chatId);
     return;
   }
@@ -888,6 +919,7 @@ async function processPendingMessages(key, entryOverride) {
     state.noIntentCount = 0;
     const segments = finalizeSegments([prompt], chatState, intentFinalizeOptions);
     await deliverResponse(sock, chatId, segments, { typingDelays: true });
+    chatState.shouldGreet = false;
     markRateLimit(chatId);
     return;
   }
@@ -909,6 +941,7 @@ async function processPendingMessages(key, entryOverride) {
 
   if (outgoingSegments?.length) {
     await deliverResponse(sock, chatId, outgoingSegments, { typingDelays: true });
+    chatState.shouldGreet = false;
   }
 
   markRateLimit(chatId);
@@ -926,7 +959,9 @@ async function handleIncomingMessage({ sock, message }) {
   markMessageProcessed(key.id);
 
   if (content?.imageMessage) {
+    const chatState = getChatState(chatId);
     await deliverResponse(sock, chatId, PAYMENT_PROOF_ACK, { typingDelays: true });
+    chatState.shouldGreet = false;
     markRateLimit(chatId);
     return;
   }
