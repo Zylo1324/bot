@@ -61,6 +61,7 @@ const MIN_SEND_GAP_MS = 1_200;
 const RATE_LIMIT_WINDOW_MS = 2_000;
 const MESSAGE_CACHE_TTL_MS = 5 * 60_000;
 const MESSAGE_INACTIVITY_TIMEOUT_MS = 7_000;
+const MESSAGE_RETRY_DELAYS_MS = [500, 1_200];
 
 const RAW_INTENT_KEYWORDS = process.env.INTENT_KEYWORDS
   ? process.env.INTENT_KEYWORDS.split(',')
@@ -566,8 +567,25 @@ async function sendMessageWithGap(sock, jid, text) {
     await sleep(wait);
   }
 
-  await sock.sendMessage(jid, { text });
-  lastSentAt.set(jid, Date.now());
+  let attempt = 0;
+  let lastError = null;
+  while (attempt <= MESSAGE_RETRY_DELAYS_MS.length) {
+    if (attempt > 0) {
+      const delay = MESSAGE_RETRY_DELAYS_MS[attempt - 1];
+      await sleep(delay);
+    }
+
+    try {
+      await sock.sendMessage(jid, { text });
+      lastSentAt.set(jid, Date.now());
+      return;
+    } catch (error) {
+      lastError = error;
+      attempt += 1;
+    }
+  }
+
+  throw lastError;
 }
 
 async function deliverResponse(sock, jid, text, options = {}) {
