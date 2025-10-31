@@ -108,7 +108,7 @@ function bufferMessage(sock, message) {
     const bundle = item.texts.slice();
     burstBuffer.delete(from);
     queue.add(() => processBundle(sock, from, message, bundle));
-  }, 900);
+  }, 450);
   item.timer.unref?.();
   burstBuffer.set(from, item);
 }
@@ -116,7 +116,9 @@ function bufferMessage(sock, message) {
 async function processBundle(sock, chatId, message, texts) {
   try {
     const name = getName(message);
-    const userText = texts.join('\n— ');
+    const userText = texts
+      .map((entry, index) => `• (${index + 1}) ${entry}`)
+      .join('\n');
 
     const prompt = `
 Eres *asesor de ventas* de Super Zylo. Habla en *tono profesional y amable*, directo.
@@ -148,16 +150,20 @@ Mensaje(s) del cliente:
 ${userText}
     `.trim();
 
+    await sock.presenceSubscribe?.(chatId).catch(() => {});
+    await sock.sendPresenceUpdate?.('composing', chatId).catch(() => {});
     const modelReply = await fastGroq(prompt);
 
     const reply = toMarkdownBlocks(`${varyPrefix(name)}\n\n${modelReply}`);
 
     await sock.sendMessage(chatId, { text: reply });
+    await sock.sendPresenceUpdate?.('paused', chatId).catch(() => {});
   } catch (error) {
     console.error('handler error:', error);
     await sock.sendMessage(chatId, {
       text: 'Hubo un detalle técnico. Intentemos de nuevo en un momento ⚙️'
     });
+    await sock.sendPresenceUpdate?.('paused', chatId).catch(() => {});
   }
 }
 
