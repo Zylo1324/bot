@@ -40,48 +40,7 @@ function toMarkdownBlocks(text) {
   const raw = typeof text === 'string' ? text : String(text ?? '');
   const normalized = raw.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   if (!normalized) return '';
-
-  const paragraphs = normalized
-    .split(/\n{2,}/)
-    .map((block) => block.trim())
-    .filter(Boolean);
-
-  const formatted = paragraphs.map((block) => {
-    const lines = block
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean);
-
-    if (lines.length <= 1) {
-      return lines[0] || '';
-    }
-
-    const looksLikeList = lines.every((line) => /^[*•\-]\s/.test(line));
-    if (looksLikeList) {
-      return lines
-        .map((line) => line.replace(/^[*•\-]\s*/, '• ').trim())
-        .join('\n');
-    }
-
-    return lines
-      .map((line) => line.replace(/^[*•\-]\s*/, '').trim())
-      .filter(Boolean)
-      .map((line) => `• ${line}`)
-      .join('\n');
-  });
-
-  return formatted.filter(Boolean).join('\n\n');
-}
-
-function varyPrefix(name) {
-  const arr = [
-    `¡Genial, *${name}*!`,
-    `Hola *${name}* 👋`,
-    `Perfecto, *${name}*!`,
-    `Encantado, *${name}*!`,
-    `Listo, *${name}*!`
-  ];
-  return arr[Math.floor(Math.random() * arr.length)];
+  return normalized;
 }
 
 function extractTextContent(message = {}) {
@@ -123,13 +82,20 @@ async function processBundle(sock, chatId, message, texts) {
     const prompt = `
 Eres *asesor de ventas* de Super Zylo. Habla en *tono profesional y amable*, directo.
 Reglas de estilo:
-- Siempre usa *Markdown* (negritas, listas, saltos de línea).
-- Usa *emojis sutiles* (máx 2 por párrafo).
-- Personaliza con el nombre del cliente si lo tienes: *${name}*.
-- No repitas las mismas frases: usa sinónimos y reformula.
-- Responde en *párrafos cortos* y *viñetas*.
-- Si hacen varias preguntas, *responde todas*.
-- Si la consulta no es de ventas, redirígela con elegancia hacia la compra.
+- Usa *Markdown compatible con WhatsApp* (negritas, cursivas, blockquotes con '>').
+- Integra *emojis contextuales* (máx 2 por bloque) sin repetirlos al inicio.
+- No saludes ni repitas muletillas al empezar; ve directo a la propuesta.
+- Menciona el nombre del cliente *${name}* solo una vez y de forma natural.
+- Organiza servicios en secciones breves con títulos tipo *- Categoría:* y detalla cada opción con líneas citadas usando '>'.
+- Si hay pocas opciones, separa igualmente cada renglón con blockquotes para que sea fácil de leer.
+- Responde en párrafos cortos y viñetas cuando corresponda; atiende todas las preguntas.
+- Si la consulta no es de ventas, redirígela con elegancia hacia una compra.
+
+Inspírate en este formato (no lo repitas literal, solo toma el estilo):
+*- Entretenimiento:*
+> Disney+ Premium + ESPN (perfil): *S/5*
+> HBO Max (perfil): *S/5*
+> Prime Video (perfil): *S/4*
 
 Catálogo breve (para referencia; no lo recites completo):
 - ChatGPT Plus: compartida (S/10) y completa (S/20, incluye Canva).
@@ -154,7 +120,7 @@ ${userText}
     await sock.sendPresenceUpdate?.('composing', chatId).catch(() => {});
     const modelReply = await fastGroq(prompt);
 
-    const reply = toMarkdownBlocks(`${varyPrefix(name)}\n\n${modelReply}`);
+    const reply = toMarkdownBlocks(modelReply);
 
     await sock.sendMessage(chatId, { text: reply });
     await sock.sendPresenceUpdate?.('paused', chatId).catch(() => {});
