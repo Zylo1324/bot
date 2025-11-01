@@ -9,7 +9,7 @@ import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
 import PQueue from 'p-queue';
 
-import { fastGroq } from './lib/groq.js';
+import { askLLM, resetChatMemory } from './lib/groq.js';
 
 const REQUIRED_ENV = ['GROQ_API_KEY'];
 const AUTH_FOLDER = './auth_state';
@@ -28,6 +28,11 @@ if (missingEnv.length > 0) {
 const queue = new PQueue({ concurrency: 1 });
 const burstBuffer = new Map(); // chatId -> { texts: [], timer: NodeJS.Timeout }
 
+const COMMAND_PATTERNS = {
+  reset: /^\s*\/reset\b/i,
+  ping: /^\s*\/ping\b/i
+};
+
 function getName(message) {
   const pn = message?.pushName?.trim();
   if (pn) return pn;
@@ -40,7 +45,10 @@ function toMarkdownBlocks(text) {
   const raw = typeof text === 'string' ? text : String(text ?? '');
   const normalized = raw.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   if (!normalized) return '';
-  return normalized;
+
+  const collapsedBold = normalized.replace(/\*{4,}/g, '**').replace(/_{4,}/g, '__');
+  const noDuplicateSpaces = collapsedBold.replace(/[ \t]{2,}/g, ' ');
+  return noDuplicateSpaces;
 }
 
 function extractTextContent(message = {}) {
@@ -72,53 +80,80 @@ function bufferMessage(sock, message) {
   burstBuffer.set(from, item);
 }
 
+async function handleCommands(sock, chatId, rawTexts) {
+  const trimmed = rawTexts.map((text) => text.trim()).filter(Boolean);
+  const remaining = [];
+  let handled = false;
+
+  for (const text of trimmed) {
+    if (COMMAND_PATTERNS.reset.test(text)) {
+      handled = true;
+      resetChatMemory(chatId);
+      await sock.sendMessage(chatId, {
+        text: 'Memoria del chat reiniciada. Cuéntame qué servicio necesitas y lo cerramos rápido ✅'
+      });
+      continue;
+    }
+
+    if (COMMAND_PATTERNS.ping.test(text)) {
+      handled = true;
+      await sock.sendMessage(chatId, { text: 'Pong 🏓 listo para ayudarte con tu compra.' });
+      continue;
+    }
+
+    remaining.push(text);
+  }
+
+  return { handled, remaining };
+}
+
 async function processBundle(sock, chatId, message, texts) {
   try {
+    const { handled, remaining } = await handleCommands(sock, chatId, texts);
+    if (handled && remaining.length === 0) {
+      return;
+    }
+
+    const effectiveTexts = remaining.length > 0 ? remaining : texts;
     const name = getName(message);
-    const userText = texts
+    const userText = effectiveTexts
       .map((entry, index) => `• (${index + 1}) ${entry}`)
       .join('\n');
 
-    const prompt = `
-Eres *asesor de ventas* de Super Zylo. Habla en *tono profesional y amable*, directo.
-Reglas de estilo:
-- Usa *Markdown compatible con WhatsApp* (negritas, cursivas, blockquotes con '>').
-- Integra *emojis contextuales* (máx 2 por bloque) sin repetirlos al inicio.
-- No saludes ni repitas muletillas al empezar; ve directo a la propuesta.
-- Menciona el nombre del cliente *${name}* solo una vez y de forma natural.
-- Organiza servicios en secciones breves con títulos tipo *- Categoría:* y detalla cada opción con líneas citadas usando '>'.
-- Si hay pocas opciones, separa igualmente cada renglón con blockquotes para que sea fácil de leer.
-- Responde en párrafos cortos y viñetas cuando corresponda; atiende todas las preguntas.
-- Si la consulta no es de ventas, redirígela con elegancia hacia una compra.
-
-Inspírate en este formato (no lo repitas literal, solo toma el estilo):
-*- Entretenimiento:*
-> Disney+ Premium + ESPN (perfil): *S/5*
-> HBO Max (perfil): *S/5*
-> Prime Video (perfil): *S/4*
-
-Catálogo breve (para referencia; no lo recites completo):
-- ChatGPT Plus: compartida (S/10) y completa (S/20, incluye Canva).
-- Disney+ Premium + ESPN (perfil).
-- HBO Max (perfil). Prime Video (perfil).
-- YouTube Premium + Music (a su correo).
-- Canva (a su correo). Capcut (cuenta completa).
-- Perplexity (cuenta). Gemini + Veo 3 (cuenta 1 año).
-- Turnitin (cuenta). DirecTV (activación a TV). Luna (juegos).
-- Grupo VIP (S/20).
-
-Política de cierre:
-- Tras resolver la duda, ofrece *pago por Yape 942632719 (Jair)* y pide *captura*.
-- Si dice “no sé” o divaga, propone 2–3 opciones claras y pregunta *¿cuál te va mejor?*.
-
-Ahora responde *bonito*, con markdown y variación.
-Mensaje(s) del cliente:
-${userText}
-    `.trim();
-
     await sock.presenceSubscribe?.(chatId).catch(() => {});
     await sock.sendPresenceUpdate?.('composing', chatId).catch(() => {});
-    const modelReply = await fastGroq(prompt);
+    const systemPrompt = `
+Eres asesor de ventas senior de Super Zylo. Tu objetivo es descubrir la intención real del cliente y llevarlo rápido a concretar la compra.
+
+Instrucciones clave:
+- Prioriza entender el contexto del mensaje. Si solo saluda o es ambiguo, responde con una pregunta breve que lo acerque a elegir un servicio.
+- Usa Markdown válido para WhatsApp: negritas con **texto** y blockquotes con '>'. Jamás dupliques las marcas de negrita.
+- Incorpora emojis contextuales (máximo 2 por bloque o párrafo) y nunca los repitas al inicio de cada línea.
+- Menciona a ${name} una única vez y solo si ayuda a personalizar. No inventes nombres.
+- Presenta el catálogo en microsecciones tipo *- Categoría:* seguidas de líneas en blockquote con el beneficio y precio. Elige solo lo relevante a la consulta.
+- Sé persuasivo y directo, enfocándote en cerrar: ofrece siguientes pasos o método de pago Yape 942632719 (Jair) cuando detectes interés.
+- Si surgen dudas técnicas, respóndelas con precisión y enlázalas con una propuesta de compra.
+- No inventes datos ni promociones inexistentes. Si no tienes información, ofrece verificar antes de cerrar la venta.
+
+Catálogo de referencia (resume solo lo oportuno):
+- Entretenimiento: Disney+ Premium + ESPN (perfil S/5), HBO Max (perfil S/5), Prime Video (perfil S/4).
+- Productividad: ChatGPT Plus (compartida S/10, completa S/20 con Canva), Perplexity (cuenta), Canva Pro, CapCut Pro.
+- Otros: YouTube Premium + Music (correo), Gemini + Veo 3 (cuenta anual), Turnitin, DirecTV (activación), Luna (juegos), Grupo VIP (S/20).
+
+Política de cierre:
+- Luego de resolver la duda, invita a confirmar preguntando «¿Lo confirmamos ahora?» u otra variante y menciona el pago por Yape con captura.
+- Cuando el cliente se muestra indeciso, ofrece 2 o 3 opciones concretas y pregunta cuál prefiere.
+
+Responde siempre en español con bloques cortos y claros.
+    `.trim();
+
+    const modelReply = await askLLM(
+      `Mensaje(s) del cliente:\n${userText}`,
+      {
+        systemPrompt,
+        chatId
+      }
+    );
 
     const reply = toMarkdownBlocks(modelReply);
 
