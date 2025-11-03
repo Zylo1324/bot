@@ -7,6 +7,7 @@
     <style>
       :root {
         color-scheme: light only;
+        --phone-horizontal: 44%;
       }
 
       * {
@@ -37,12 +38,15 @@
 
       .phone {
         position: absolute;
-        inset: 0 auto 0 90px;
+        top: 0;
+        bottom: 0;
+        left: var(--phone-horizontal);
         display: flex;
         justify-content: center;
         align-items: center;
         width: clamp(260px, 30vw, 360px);
         height: 100%;
+        transform: translateX(-50%);
       }
 
       .phone::after {
@@ -152,6 +156,17 @@
         opacity: 0.75;
       }
 
+      main input[type="range"],
+      main label[for*="posicion"],
+      main label[for*="position"],
+      main output[for*="posicion"],
+      main output[for*="position"],
+      main .slider-label,
+      main .slider-value,
+      main .slider-percentage {
+        display: none !important;
+      }
+
       @media (max-width: 900px) {
         main {
           height: auto;
@@ -160,8 +175,12 @@
 
         .phone {
           position: relative;
-          inset: auto;
+          top: auto;
+          right: auto;
+          bottom: auto;
+          left: 50%;
           margin: 60px auto 40px;
+          transform: translateX(-50%);
         }
 
         .phone::after {
@@ -199,5 +218,31 @@
       </article>
       <div class="hero-overlay" aria-hidden="true"></div>
     </main>
+    <script>
+      (() => {
+        const root = document.documentElement;
+        root?.style?.setProperty('--phone-horizontal', '44%');
+
+        const slider = document.querySelector('input[type="range"]');
+        if (!slider) return;
+
+        slider.value = '44';
+        slider.dispatchEvent(new Event('input', { bubbles: true }));
+        slider.style.setProperty('display', 'none');
+
+        if (slider.id) {
+          const associatedLabel = document.querySelector(`label[for="${slider.id}"]`);
+          associatedLabel?.style?.setProperty('display', 'none');
+
+          const readout = document.querySelector(
+            `#${slider.id}-value, output[for="${slider.id}"], [data-slider-value-for="${slider.id}"]`
+          );
+          readout?.style?.setProperty('display', 'none');
+        }
+
+        const container = slider.closest('.slider-control, .slider-wrapper, .control-row');
+        container?.style?.setProperty('display', 'none');
+      })();
+    </script>
   </body>
 </html>
