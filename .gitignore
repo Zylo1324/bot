@@ -1,0 +1,5 @@
+auth/
+auth_state/
+node_modules/
+.env
+.env
