@@ -12,35 +12,19 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import { askLLM, resetChatMemory } from './lib/groq.js';
+import { loadInstructions } from './lib/instructionManager.js';
+import { detectService, wantsCatalog } from './lib/intents.js';
+import { limitWords, verticalize } from './lib/guardrails.js';
+
+const INSTRUCTIONS = loadInstructions('./config/SUPER_ZYLO_INSTRUCTIONS_VENTAS.md');
+console.log('[prompts] Cargado SUPER_ZYLO_INSTRUCTIONS_VENTAS.md:', INSTRUCTIONS.slice(0, 120), '…');
 
 const REQUIRED_ENV = ['GROQ_API_KEY'];
 const AUTH_FOLDER = './auth_state';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const SERVICES_IMAGE_PATH = join(__dirname, 'assets', 'Servicios.jpg');
-const IMAGE_COOLDOWN_MS = 5 * 60_000;
-const SERVICE_KEYWORDS = [
-  'servicio',
-  'servicios',
-  'plan',
-  'planes',
-  'catálogo',
-  'catalogo',
-  'ofertas',
-  'ofreces',
-  'ofrecen',
-  'quiero adquirir',
-  'quiero un servicio',
-  'quiero contratar',
-  'que tienen',
-  'qué tienen',
-  'que opciones',
-  'qué opciones',
-  'muéstrame los servicios',
-  'muestrame los servicios',
-  'mostrar servicios'
-];
-const NORMALIZED_SERVICE_KEYWORDS = SERVICE_KEYWORDS.map((keyword) => normalizeForMatch(keyword));
+const conversationState = new Map(); // chatId -> { askedName: boolean, greetedByName: boolean }
 
 const missingEnv = REQUIRED_ENV.filter((key) => {
   const value = process.env[key];
@@ -55,7 +39,6 @@ if (missingEnv.length > 0) {
 // --- helpers ---
 const queue = new PQueue({ concurrency: 1 });
 const burstBuffer = new Map(); // chatId -> { texts: [], timer: NodeJS.Timeout }
-const lastServiceImageSent = new Map(); // chatId -> timestamp
 
 const COMMAND_PATTERNS = {
   reset: /^\s*\/reset\b/i,
@@ -80,69 +63,16 @@ function toMarkdownBlocks(text) {
   return noDuplicateSpaces;
 }
 
-function enforceWordLimit(text, limit = 30) {
-  if (!text) return text;
-  const tokens = text.split(/\s+/).filter(Boolean);
-  if (tokens.length <= limit) return text;
-  let trimmed = tokens.slice(0, limit).join(' ');
-  const boldMarkers = (trimmed.match(/\*\*/g) || []).length;
-  if (boldMarkers % 2 !== 0) {
-    trimmed += '**';
-  }
-  const italicMarkers = (trimmed.match(/_/g) || []).length;
-  if (italicMarkers % 2 !== 0) {
-    trimmed += '_';
-  }
-  const strikeMarkers = (trimmed.match(/~/g) || []).length;
-  if (strikeMarkers % 2 !== 0) {
-    trimmed += '~';
-  }
-  return trimmed;
+function greetByName(name) {
+  if (!name) return '¡Hola! 😄 ¿Cómo te llamas? Así puedo ayudarte mejor.';
+  return `¡Hola ${name}! 😄 Cuéntame, ¿qué servicio deseas adquirir hoy?`;
 }
 
-function normalizeForMatch(text) {
-  return (text ?? '')
-    .toString()
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function shouldSendServicesImage(texts) {
-  if (!Array.isArray(texts) || texts.length === 0) {
-    return false;
-  }
-
-  const combined = normalizeForMatch(texts.join(' '));
-  if (!combined) return false;
-
-  return NORMALIZED_SERVICE_KEYWORDS.some((keyword) => combined.includes(keyword));
-}
-
-async function maybeSendServicesImage(sock, chatId, texts) {
-  if (!shouldSendServicesImage(texts)) {
-    return;
-  }
-
-  const now = Date.now();
-  const lastSent = lastServiceImageSent.get(chatId) || 0;
-  if (now - lastSent < IMAGE_COOLDOWN_MS) {
-    return;
-  }
-
-  await sock
-    .sendMessage(chatId, {
-      image: { url: SERVICES_IMAGE_PATH },
-      caption: 'Opciones premium ⭐ ¿Cuál deseas?'
-    })
-    .catch((error) => {
-      console.error('No se pudo enviar la imagen de servicios:', error);
-    });
-
-  lastServiceImageSent.set(chatId, now);
+function buildMessages(userText) {
+  return [
+    { role: 'system', content: INSTRUCTIONS },
+    { role: 'user', content: userText }
+  ];
 }
 
 function extractTextContent(message = {}) {
@@ -183,7 +113,7 @@ async function handleCommands(sock, chatId, rawTexts) {
     if (COMMAND_PATTERNS.reset.test(text)) {
       handled = true;
       resetChatMemory(chatId);
-      lastServiceImageSent.delete(chatId);
+      conversationState.delete(chatId);
       await sock.sendMessage(chatId, {
         text: 'Memoria del chat reiniciada. Cuéntame qué servicio necesitas y lo cerramos rápido ✅'
       });
@@ -210,42 +140,57 @@ async function processBundle(sock, chatId, message, texts) {
     }
 
     const effectiveTexts = remaining.length > 0 ? remaining : texts;
-    const name = getName(message);
     const userText = effectiveTexts
       .map((entry, index) => `• (${index + 1}) ${entry}`)
       .join('\n');
 
-    await maybeSendServicesImage(sock, chatId, effectiveTexts);
-
     await sock.presenceSubscribe?.(chatId).catch(() => {});
     await sock.sendPresenceUpdate?.('composing', chatId).catch(() => {});
-    const systemPrompt = `
-Eres el asistente de ventas estrella de SUPER ZYLO.
 
-Reglas estrictas:
-- Responde en español simple, máximo 30 palabras por mensaje, tono amable y persuasivo con 1 o 2 emojis.
-- Fusiona los mensajes recientes del cliente y responde en un único bloque.
-- Usa Markdown básico compatible con WhatsApp; negritas solo con **texto**. Evita listas extensas.
-- Menciona a ${name} únicamente si aporta cercanía.
-- Destaca entrega inmediata, garantía y soporte cuando avances al cierre.
-- Solicita comprobante de pago (Yape 942632719 Jair, Plin, PayPal, Binance o transferencia) al detectar intención de compra.
-- Si preguntan por servicios o planes, indica que ya compartiste la imagen Servicios.jpg y pregunta cuál desea.
-- Describe con precisión solo el servicio solicitado y termina invitando a confirmar.
-- Si desean vender, pide el detalle del pedido y la captura de pago por los canales aceptados.
-- Redirige cualquier tema ajeno a los servicios con suavidad y vuelve a la venta.
-    `.trim();
+    const baseContext = message || {};
+    const detectedName =
+      baseContext?.user?.name ||
+      baseContext?.from?.name ||
+      baseContext?.profileName ||
+      baseContext?.waName ||
+      baseContext?.metadata?.name ||
+      null;
+    const fallbackName = getName(message);
+    const resolvedName = detectedName || (fallbackName && fallbackName !== 'amigo' ? fallbackName : null);
 
-    const modelReply = await askLLM(
-      `Mensaje(s) del cliente:\n${userText}`,
-      {
-        systemPrompt,
-        chatId
-      }
-    );
+    const state = conversationState.get(chatId) || { askedName: false, greetedByName: false };
+    const shouldAskName = !resolvedName && !state.askedName;
+    const shouldGreetByName = Boolean(resolvedName) && !state.greetedByName;
+    const shouldGreet = shouldAskName || shouldGreetByName;
+    const greeting = shouldAskName
+      ? greetByName(null)
+      : shouldGreetByName
+        ? greetByName(resolvedName)
+        : '';
 
-    const reply = enforceWordLimit(toMarkdownBlocks(modelReply));
+    const messages = buildMessages(`Mensaje(s) del cliente:\n${userText}`);
+    const modelReply = await askLLM(messages[1].content, {
+      systemPrompt: messages[0].content,
+      chatId
+    });
 
-    await sock.sendMessage(chatId, { text: reply });
+    let combined = shouldGreet ? `${greeting}\n${modelReply}` : modelReply;
+    combined = toMarkdownBlocks(combined);
+    combined = verticalize(combined, 3);
+    combined = limitWords(combined, 30);
+    combined = verticalize(combined, 3);
+
+    const shouldSendImage = wantsCatalog(userText) && !detectService(userText);
+    const outgoingPayload = shouldSendImage
+      ? { image: { url: SERVICES_IMAGE_PATH }, caption: combined }
+      : { text: combined };
+
+    await sock.sendMessage(chatId, outgoingPayload);
+
+    conversationState.set(chatId, {
+      askedName: state.askedName || shouldAskName,
+      greetedByName: state.greetedByName || shouldGreetByName
+    });
     await sock.sendPresenceUpdate?.('paused', chatId).catch(() => {});
   } catch (error) {
     console.error('handler error:', error);
