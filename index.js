@@ -31,6 +31,10 @@ const SERVICE_KEYWORDS = [
   'ofrecen',
   'quiero adquirir',
   'quiero un servicio',
+  'quiero contratar',
+  'muéstrame los servicios',
+  'muestrame los servicios',
+  'mostrar servicios',
   'que tienen',
   'qué tienen',
   'que opciones',
@@ -56,14 +60,6 @@ const COMMAND_PATTERNS = {
   reset: /^\s*\/reset\b/i,
   ping: /^\s*\/ping\b/i
 };
-
-function getName(message) {
-  const pn = message?.pushName?.trim();
-  if (pn) return pn;
-  const jid = message?.key?.participant || message?.key?.remoteJid || '';
-  const phone = jid.split('@')[0]?.split(':')[0]?.replace(/\D/g, '') || 'amigo';
-  return phone.length >= 6 ? phone : 'amigo';
-}
 
 function toMarkdownBlocks(text) {
   const raw = typeof text === 'string' ? text : String(text ?? '');
@@ -120,7 +116,7 @@ async function maybeSendServicesImage(sock, chatId, texts) {
   await sock
     .sendMessage(chatId, {
       image: { url: SERVICES_IMAGE_PATH },
-      caption: 'Opciones premium ⭐ ¿Cuál deseas?'
+      caption: 'Te envío las opciones 😊 ¿Cuál deseas?'
     })
     .catch((error) => {
       console.error('No se pudo enviar la imagen de servicios:', error);
@@ -194,7 +190,6 @@ async function processBundle(sock, chatId, message, texts) {
     }
 
     const effectiveTexts = remaining.length > 0 ? remaining : texts;
-    const name = getName(message);
     const userText = effectiveTexts
       .map((entry, index) => `• (${index + 1}) ${entry}`)
       .join('\n');
@@ -204,19 +199,20 @@ async function processBundle(sock, chatId, message, texts) {
     await sock.presenceSubscribe?.(chatId).catch(() => {});
     await sock.sendPresenceUpdate?.('composing', chatId).catch(() => {});
     const systemPrompt = `
-Eres el asistente de ventas estrella de SUPER ZYLO.
+Eres el asistente de ventas oficial de SUPER ZYLO.
 
 Reglas estrictas:
-- Responde en español simple, máximo 30 palabras por mensaje, tono amable y persuasivo con 1 o 2 emojis.
-- Fusiona los mensajes recientes del cliente y responde en un único bloque.
-- Usa Markdown básico compatible con WhatsApp; negritas solo con **texto**. Evita listas extensas.
-- Menciona a ${name} únicamente si aporta cercanía.
-- Destaca entrega inmediata, garantía y soporte cuando avances al cierre.
-- Solicita comprobante de pago (Yape 942632719 Jair, Plin, PayPal, Binance o transferencia) al detectar intención de compra.
-- Si preguntan por servicios o planes, indica que ya compartiste la imagen Servicios.jpg y pregunta cuál desea.
-- Describe con precisión solo el servicio solicitado y termina invitando a confirmar.
-- Si desean vender, pide el detalle del pedido y la captura de pago por los canales aceptados.
-- Redirige cualquier tema ajeno a los servicios con suavidad y vuelve a la venta.
+- Responde en español natural, máximo 30 palabras por mensaje, con tono amable, claro y persuasivo usando 1 o 2 emojis.
+- Une todos los mensajes recientes del cliente y responde en un único bloque.
+- Emplea Markdown simple; usa **negritas** solo cuando aporte claridad.
+- Si detectas frases como "quiero un servicio", "quiero adquirir" o "muéstrame los servicios", confirma que enviaste la imagen Servicios.jpg con el texto "Te envío las opciones 😊 ¿Cuál deseas?" y vuelve a preguntar qué desea.
+- Al mencionar un servicio específico, describe únicamente ese servicio (precio y beneficios) y cierra invitando al pago seguro.
+- Nunca enumeres servicios separados por comas ni listes más de tres; cada servicio debe ir en su propia línea.
+- Si piden detalles de planes, explica: "Cuentas completas: privadas, multi-dispositivo.", "Cuentas compartidas: 4–5 personas, un dispositivo.", "Perfiles: premium, no cuenta completa." y motiva la compra.
+- Resalta entrega en 5-10 minutos y garantía mensual cuando avances al cierre.
+- Acepta pagos por Yape 942632719 (Jair), Plin, PayPal, Binance o transferencia; solicita captura del pago más el servicio elegido antes de entregar.
+- Redirige con empatía cualquier tema ajeno preguntando qué servicio desea adquirir hoy.
+- Evita tecnicismos y mantén foco total en guiar al cliente hacia la compra.
     `.trim();
 
     const modelReply = await askLLM(
