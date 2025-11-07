@@ -31,11 +31,16 @@ const SERVICE_KEYWORDS = [
   'ofrecen',
   'quiero adquirir',
   'quiero un servicio',
+  'quiero contratar',
   'que tienen',
   'qué tienen',
   'que opciones',
-  'qué opciones'
+  'qué opciones',
+  'muéstrame los servicios',
+  'muestrame los servicios',
+  'mostrar servicios'
 ];
+const NORMALIZED_SERVICE_KEYWORDS = SERVICE_KEYWORDS.map((keyword) => normalizeForMatch(keyword));
 
 const missingEnv = REQUIRED_ENV.filter((key) => {
   const value = process.env[key];
@@ -95,15 +100,26 @@ function enforceWordLimit(text, limit = 30) {
   return trimmed;
 }
 
+function normalizeForMatch(text) {
+  return (text ?? '')
+    .toString()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function shouldSendServicesImage(texts) {
   if (!Array.isArray(texts) || texts.length === 0) {
     return false;
   }
 
-  const combined = texts.join(' ').toLowerCase();
+  const combined = normalizeForMatch(texts.join(' '));
   if (!combined) return false;
 
-  return SERVICE_KEYWORDS.some((keyword) => combined.includes(keyword));
+  return NORMALIZED_SERVICE_KEYWORDS.some((keyword) => combined.includes(keyword));
 }
 
 async function maybeSendServicesImage(sock, chatId, texts) {
