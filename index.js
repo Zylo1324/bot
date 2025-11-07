@@ -10,9 +10,17 @@ import qrcode from 'qrcode-terminal';
 import PQueue from 'p-queue';
 
 import { askLLM, resetChatMemory } from './lib/groq.js';
+import { loadInstructions } from './lib/instructionManager.js';
+import { detectService, wantsCatalog } from './lib/intents.js';
+import { limitWords, verticalize } from './lib/guardrails.js';
+
+const INSTRUCTIONS = loadInstructions('./config/SUPER_ZYLO_INSTRUCTIONS_VENTAS.md');
+console.log('[prompts] Cargado SUPER_ZYLO_INSTRUCTIONS_VENTAS.md:', INSTRUCTIONS.slice(0, 120), '…');
 
 const REQUIRED_ENV = ['GROQ_API_KEY'];
 const AUTH_FOLDER = './auth_state';
+
+const conversationState = new Map(); // chatId -> { greetedByName: boolean, askedName: boolean }
 
 const missingEnv = REQUIRED_ENV.filter((key) => {
   const value = process.env[key];
@@ -33,12 +41,28 @@ const COMMAND_PATTERNS = {
   ping: /^\s*\/ping\b/i
 };
 
-function getName(message) {
+function greetByName(name) {
+  if (!name) return '¡Hola! 😄 ¿Cómo te llamas? Así puedo ayudarte mejor.';
+  return `¡Hola ${name}! 😄 Cuéntame, ¿qué servicio deseas adquirir hoy?`;
+}
+
+function buildMessages(userText) {
+  return [
+    { role: 'system', content: INSTRUCTIONS },
+    { role: 'user', content: userText }
+  ];
+}
+
+function deriveFallbackName(message) {
+  const explicitName = message?.message?.contactMessage?.displayName?.trim();
+  if (explicitName) return explicitName;
+
   const pn = message?.pushName?.trim();
   if (pn) return pn;
+
   const jid = message?.key?.participant || message?.key?.remoteJid || '';
-  const phone = jid.split('@')[0]?.split(':')[0]?.replace(/\D/g, '') || 'amigo';
-  return phone.length >= 6 ? phone : 'amigo';
+  const phone = jid.split('@')[0]?.split(':')[0]?.replace(/\D/g, '') || '';
+  return phone.length >= 6 ? phone : null;
 }
 
 function toMarkdownBlocks(text) {
@@ -89,6 +113,7 @@ async function handleCommands(sock, chatId, rawTexts) {
     if (COMMAND_PATTERNS.reset.test(text)) {
       handled = true;
       resetChatMemory(chatId);
+      conversationState.delete(chatId);
       await sock.sendMessage(chatId, {
         text: 'Memoria del chat reiniciada. Cuéntame qué servicio necesitas y lo cerramos rápido ✅'
       });
@@ -115,49 +140,66 @@ async function processBundle(sock, chatId, message, texts) {
     }
 
     const effectiveTexts = remaining.length > 0 ? remaining : texts;
-    const name = getName(message);
-    const userText = effectiveTexts
-      .map((entry, index) => `• (${index + 1}) ${entry}`)
-      .join('\n');
+    const joinedText = effectiveTexts.join('\n').trim();
+    const userText = joinedText || effectiveTexts.join('\n');
+
+    const ctx = message || {};
+    const fallbackName = deriveFallbackName(message);
+    const customerName =
+      ctx?.user?.name ||
+      ctx?.from?.name ||
+      ctx?.profileName ||
+      ctx?.waName ||
+      ctx?.metadata?.name ||
+      fallbackName ||
+      null;
+
+    const state = conversationState.get(chatId) || { greetedByName: false, askedName: false };
+    let greetingPrefix = '';
+
+    if (customerName && !state.greetedByName) {
+      greetingPrefix = greetByName(customerName);
+      state.greetedByName = true;
+      state.askedName = true;
+    } else if (!customerName && !state.askedName) {
+      greetingPrefix = greetByName(null);
+      state.askedName = true;
+    }
+
+    conversationState.set(chatId, state);
+
+    const messages = buildMessages(userText);
 
     await sock.presenceSubscribe?.(chatId).catch(() => {});
     await sock.sendPresenceUpdate?.('composing', chatId).catch(() => {});
-    const systemPrompt = `
-Eres asesor de ventas senior de Super Zylo. Tu objetivo es descubrir la intención real del cliente y llevarlo rápido a concretar la compra.
+    const completionText = await askLLM(messages[1].content, {
+      systemPrompt: messages[0].content,
+      chatId
+    });
 
-Instrucciones clave:
-- Prioriza entender el contexto del mensaje. Si solo saluda o es ambiguo, responde con una pregunta breve que lo acerque a elegir un servicio.
-- Usa Markdown válido para WhatsApp: negritas con **texto** y blockquotes con '>'. Jamás dupliques las marcas de negrita.
-- Incorpora emojis contextuales (máximo 2 por bloque o párrafo) y nunca los repitas al inicio de cada línea.
-- Menciona a ${name} una única vez y solo si ayuda a personalizar. No inventes nombres.
-- Presenta el catálogo en microsecciones tipo *- Categoría:* seguidas de líneas en blockquote con el beneficio y precio. Elige solo lo relevante a la consulta.
-- Sé persuasivo y directo, enfocándote en cerrar: ofrece siguientes pasos o método de pago Yape 942632719 (Jair) cuando detectes interés.
-- Si surgen dudas técnicas, respóndelas con precisión y enlázalas con una propuesta de compra.
-- No inventes datos ni promociones inexistentes. Si no tienes información, ofrece verificar antes de cerrar la venta.
+    const sanitizedReply = toMarkdownBlocks(completionText);
+    let combined = sanitizedReply;
 
-Catálogo de referencia (resume solo lo oportuno):
-- Entretenimiento: Disney+ Premium + ESPN (perfil S/5), HBO Max (perfil S/5), Prime Video (perfil S/4).
-- Productividad: ChatGPT Plus (compartida S/10, completa S/20 con Canva), Perplexity (cuenta), Canva Pro, CapCut Pro.
-- Otros: YouTube Premium + Music (correo), Gemini + Veo 3 (cuenta anual), Turnitin, DirecTV (activación), Luna (juegos), Grupo VIP (S/20).
+    if (greetingPrefix) {
+      combined = `${greetingPrefix}\n${combined}`.trim();
+    }
 
-Política de cierre:
-- Luego de resolver la duda, invita a confirmar preguntando «¿Lo confirmamos ahora?» u otra variante y menciona el pago por Yape con captura.
-- Cuando el cliente se muestra indeciso, ofrece 2 o 3 opciones concretas y pregunta cuál prefiere.
-
-Responde siempre en español con bloques cortos y claros.
-    `.trim();
-
-    const modelReply = await askLLM(
-      `Mensaje(s) del cliente:\n${userText}`,
-      {
-        systemPrompt,
-        chatId
-      }
+    const verticalized = verticalize(combined, 3);
+    const limited = limitWords(verticalized.replace(/\n/g, ' __NL__ '), 30);
+    const finalReply = toMarkdownBlocks(
+      limited.replace(/__NL__/g, '\n').replace(/\s*\n\s*/g, '\n')
     );
 
-    const reply = toMarkdownBlocks(modelReply);
+    const shouldSendImage = wantsCatalog(userText) && !detectService(userText);
 
-    await sock.sendMessage(chatId, { text: reply });
+    if (shouldSendImage) {
+      await sock.sendMessage(chatId, {
+        image: { url: 'assets/Servicios.jpg' },
+        caption: finalReply
+      });
+    } else {
+      await sock.sendMessage(chatId, { text: finalReply });
+    }
     await sock.sendPresenceUpdate?.('paused', chatId).catch(() => {});
   } catch (error) {
     console.error('handler error:', error);
