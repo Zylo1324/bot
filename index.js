@@ -9,6 +9,7 @@ import { Boom } from '@hapi/boom';
 import PQueue from 'p-queue';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync } from 'node:fs';
 
 import { askLLM, resetChatMemory } from './lib/groq.js';
 import { loadInstructions } from './lib/instructionManager.js';
@@ -19,9 +20,9 @@ const INSTRUCTIONS = loadInstructions('./config/SUPER_ZYLO_INSTRUCTIONS_VENTAS.m
 console.log('[prompts] Cargado SUPER_ZYLO_INSTRUCTIONS_VENTAS.md:', INSTRUCTIONS.slice(0, 120), '…');
 
 const REQUIRED_ENV = ['GROQ_API_KEY'];
-const SESSION_FOLDER = 'C:/Users/USER/bot_sessions';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const SESSION_FOLDER = process.env.SESSION_FOLDER || join(__dirname, 'bot_sessions');
 const SERVICES_IMAGE_PATH = join(__dirname, 'assets', 'Servicios.jpg');
 const conversationState = new Map(); // chatId -> { askedName: boolean, greetedByName: boolean }
 
@@ -201,6 +202,9 @@ async function processBundle(sock, chatId, message, texts) {
 }
 
 async function startWA() {
+  if (!existsSync(SESSION_FOLDER)) {
+    mkdirSync(SESSION_FOLDER, { recursive: true });
+  }
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_FOLDER);
   const { version } = await fetchLatestBaileysVersion();
   console.log('🔍 Versión de WhatsApp Web detectada:', Array.isArray(version) ? version.join('.') : version);
