@@ -8,11 +8,34 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
 import PQueue from 'p-queue';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 import { askLLM, resetChatMemory } from './lib/groq.js';
 
 const REQUIRED_ENV = ['GROQ_API_KEY'];
 const AUTH_FOLDER = './auth_state';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const SERVICES_IMAGE_PATH = join(__dirname, 'assets', 'Servicios.jpg');
+const IMAGE_COOLDOWN_MS = 5 * 60_000;
+const SERVICE_KEYWORDS = [
+  'servicio',
+  'servicios',
+  'plan',
+  'planes',
+  'catálogo',
+  'catalogo',
+  'ofertas',
+  'ofreces',
+  'ofrecen',
+  'quiero adquirir',
+  'quiero un servicio',
+  'que tienen',
+  'qué tienen',
+  'que opciones',
+  'qué opciones'
+];
 
 const missingEnv = REQUIRED_ENV.filter((key) => {
   const value = process.env[key];
@@ -27,6 +50,7 @@ if (missingEnv.length > 0) {
 // --- helpers ---
 const queue = new PQueue({ concurrency: 1 });
 const burstBuffer = new Map(); // chatId -> { texts: [], timer: NodeJS.Timeout }
+const lastServiceImageSent = new Map(); // chatId -> timestamp
 
 const COMMAND_PATTERNS = {
   reset: /^\s*\/reset\b/i,
@@ -49,6 +73,60 @@ function toMarkdownBlocks(text) {
   const collapsedBold = normalized.replace(/\*{4,}/g, '**').replace(/_{4,}/g, '__');
   const noDuplicateSpaces = collapsedBold.replace(/[ \t]{2,}/g, ' ');
   return noDuplicateSpaces;
+}
+
+function enforceWordLimit(text, limit = 30) {
+  if (!text) return text;
+  const tokens = text.split(/\s+/).filter(Boolean);
+  if (tokens.length <= limit) return text;
+  let trimmed = tokens.slice(0, limit).join(' ');
+  const boldMarkers = (trimmed.match(/\*\*/g) || []).length;
+  if (boldMarkers % 2 !== 0) {
+    trimmed += '**';
+  }
+  const italicMarkers = (trimmed.match(/_/g) || []).length;
+  if (italicMarkers % 2 !== 0) {
+    trimmed += '_';
+  }
+  const strikeMarkers = (trimmed.match(/~/g) || []).length;
+  if (strikeMarkers % 2 !== 0) {
+    trimmed += '~';
+  }
+  return trimmed;
+}
+
+function shouldSendServicesImage(texts) {
+  if (!Array.isArray(texts) || texts.length === 0) {
+    return false;
+  }
+
+  const combined = texts.join(' ').toLowerCase();
+  if (!combined) return false;
+
+  return SERVICE_KEYWORDS.some((keyword) => combined.includes(keyword));
+}
+
+async function maybeSendServicesImage(sock, chatId, texts) {
+  if (!shouldSendServicesImage(texts)) {
+    return;
+  }
+
+  const now = Date.now();
+  const lastSent = lastServiceImageSent.get(chatId) || 0;
+  if (now - lastSent < IMAGE_COOLDOWN_MS) {
+    return;
+  }
+
+  await sock
+    .sendMessage(chatId, {
+      image: { url: SERVICES_IMAGE_PATH },
+      caption: 'Opciones premium ⭐ ¿Cuál deseas?'
+    })
+    .catch((error) => {
+      console.error('No se pudo enviar la imagen de servicios:', error);
+    });
+
+  lastServiceImageSent.set(chatId, now);
 }
 
 function extractTextContent(message = {}) {
@@ -89,6 +167,7 @@ async function handleCommands(sock, chatId, rawTexts) {
     if (COMMAND_PATTERNS.reset.test(text)) {
       handled = true;
       resetChatMemory(chatId);
+      lastServiceImageSent.delete(chatId);
       await sock.sendMessage(chatId, {
         text: 'Memoria del chat reiniciada. Cuéntame qué servicio necesitas y lo cerramos rápido ✅'
       });
@@ -120,31 +199,24 @@ async function processBundle(sock, chatId, message, texts) {
       .map((entry, index) => `• (${index + 1}) ${entry}`)
       .join('\n');
 
+    await maybeSendServicesImage(sock, chatId, effectiveTexts);
+
     await sock.presenceSubscribe?.(chatId).catch(() => {});
     await sock.sendPresenceUpdate?.('composing', chatId).catch(() => {});
     const systemPrompt = `
-Eres asesor de ventas senior de Super Zylo. Tu objetivo es descubrir la intención real del cliente y llevarlo rápido a concretar la compra.
+Eres el asistente de ventas estrella de SUPER ZYLO.
 
-Instrucciones clave:
-- Prioriza entender el contexto del mensaje. Si solo saluda o es ambiguo, responde con una pregunta breve que lo acerque a elegir un servicio.
-- Usa Markdown válido para WhatsApp: negritas con **texto** y blockquotes con '>'. Jamás dupliques las marcas de negrita.
-- Incorpora emojis contextuales (máximo 2 por bloque o párrafo) y nunca los repitas al inicio de cada línea.
-- Menciona a ${name} una única vez y solo si ayuda a personalizar. No inventes nombres.
-- Presenta el catálogo en microsecciones tipo *- Categoría:* seguidas de líneas en blockquote con el beneficio y precio. Elige solo lo relevante a la consulta.
-- Sé persuasivo y directo, enfocándote en cerrar: ofrece siguientes pasos o método de pago Yape 942632719 (Jair) cuando detectes interés.
-- Si surgen dudas técnicas, respóndelas con precisión y enlázalas con una propuesta de compra.
-- No inventes datos ni promociones inexistentes. Si no tienes información, ofrece verificar antes de cerrar la venta.
-
-Catálogo de referencia (resume solo lo oportuno):
-- Entretenimiento: Disney+ Premium + ESPN (perfil S/5), HBO Max (perfil S/5), Prime Video (perfil S/4).
-- Productividad: ChatGPT Plus (compartida S/10, completa S/20 con Canva), Perplexity (cuenta), Canva Pro, CapCut Pro.
-- Otros: YouTube Premium + Music (correo), Gemini + Veo 3 (cuenta anual), Turnitin, DirecTV (activación), Luna (juegos), Grupo VIP (S/20).
-
-Política de cierre:
-- Luego de resolver la duda, invita a confirmar preguntando «¿Lo confirmamos ahora?» u otra variante y menciona el pago por Yape con captura.
-- Cuando el cliente se muestra indeciso, ofrece 2 o 3 opciones concretas y pregunta cuál prefiere.
-
-Responde siempre en español con bloques cortos y claros.
+Reglas estrictas:
+- Responde en español simple, máximo 30 palabras por mensaje, tono amable y persuasivo con 1 o 2 emojis.
+- Fusiona los mensajes recientes del cliente y responde en un único bloque.
+- Usa Markdown básico compatible con WhatsApp; negritas solo con **texto**. Evita listas extensas.
+- Menciona a ${name} únicamente si aporta cercanía.
+- Destaca entrega inmediata, garantía y soporte cuando avances al cierre.
+- Solicita comprobante de pago (Yape 942632719 Jair, Plin, PayPal, Binance o transferencia) al detectar intención de compra.
+- Si preguntan por servicios o planes, indica que ya compartiste la imagen Servicios.jpg y pregunta cuál desea.
+- Describe con precisión solo el servicio solicitado y termina invitando a confirmar.
+- Si desean vender, pide el detalle del pedido y la captura de pago por los canales aceptados.
+- Redirige cualquier tema ajeno a los servicios con suavidad y vuelve a la venta.
     `.trim();
 
     const modelReply = await askLLM(
@@ -155,7 +227,7 @@ Responde siempre en español con bloques cortos y claros.
       }
     );
 
-    const reply = toMarkdownBlocks(modelReply);
+    const reply = enforceWordLimit(toMarkdownBlocks(modelReply));
 
     await sock.sendMessage(chatId, { text: reply });
     await sock.sendPresenceUpdate?.('paused', chatId).catch(() => {});
