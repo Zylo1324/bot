@@ -6,7 +6,6 @@ import makeWASocket, {
   useMultiFileAuthState
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
-import qrcode from 'qrcode-terminal';
 import PQueue from 'p-queue';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -20,7 +19,7 @@ const INSTRUCTIONS = loadInstructions('./config/SUPER_ZYLO_INSTRUCTIONS_VENTAS.m
 console.log('[prompts] Cargado SUPER_ZYLO_INSTRUCTIONS_VENTAS.md:', INSTRUCTIONS.slice(0, 120), '…');
 
 const REQUIRED_ENV = ['GROQ_API_KEY'];
-const AUTH_FOLDER = './auth_state';
+const SESSION_FOLDER = 'C:/Users/USER/bot_sessions';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const SERVICES_IMAGE_PATH = join(__dirname, 'assets', 'Servicios.jpg');
@@ -201,50 +200,51 @@ async function processBundle(sock, chatId, message, texts) {
   }
 }
 
-async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+async function startWA() {
+  const { state, saveCreds } = await useMultiFileAuthState(SESSION_FOLDER);
   const { version } = await fetchLatestBaileysVersion();
+  console.log('🔍 Versión de WhatsApp Web detectada:', Array.isArray(version) ? version.join('.') : version);
 
   const sock = makeWASocket({
-    version,
     auth: state,
-    printQRInTerminal: false
+    version,
+    printQRInTerminal: true,
+    browser: ['Windows', 'Chrome', '10'],
+    syncFullHistory: false,
+    connectTimeoutMs: 60_000,
+    keepAliveIntervalMs: 20_000,
+    markOnlineOnConnect: false
   });
 
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      console.log('Escanea el siguiente código QR para vincular la sesión:');
-      qrcode.generate(qr, { small: true });
-    }
+    const { connection, lastDisconnect } = update || {};
 
     if (connection === 'open') {
-      console.log('Bot conectado correctamente.');
+      console.log('✅ Conectado correctamente a WhatsApp Web');
       return;
     }
 
     if (connection === 'close') {
       const error = lastDisconnect?.error;
       const statusCode =
-        error && error instanceof Boom ? error.output?.statusCode : lastDisconnect?.error?.output?.statusCode;
+        error instanceof Boom
+          ? error.output?.statusCode
+          : error?.output?.statusCode ?? lastDisconnect?.error?.output?.statusCode;
 
       if (statusCode === DisconnectReason.loggedOut) {
-        console.log('La sesión se cerró de forma permanente. Elimina auth_state para reautenticar.');
+        console.log('🚪 Sesión cerrada permanentemente, borra bot_sessions y reescanea.');
         return;
       }
 
-      if (statusCode === 515) {
-        console.log('🌀 Reinicio requerido (515). Esperando 5s antes de reintentar...');
-        await new Promise((resolve) => setTimeout(resolve, 5_000));
-      } else {
-        console.log('⚠️ Desconexión detectada. Reintentando...');
-        await new Promise((resolve) => setTimeout(resolve, 2_000));
+      console.log('⚠️ Conexión cerrada. Reintentando...');
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      try {
+        await startWA();
+      } catch (reconnectError) {
+        console.error('Error al intentar reconectar:', reconnectError);
       }
-
-      startBot().catch((err) => console.error('Error al reconectar el bot:', err));
     }
   });
 
@@ -262,6 +262,6 @@ async function startBot() {
   return sock;
 }
 
-startBot().catch((error) => {
+startWA().catch((error) => {
   console.error('No fue posible iniciar el bot:', error);
 });
