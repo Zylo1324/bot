@@ -85,16 +85,24 @@ function extractTextContent(message = {}) {
   );
 }
 
-function splitIntoWordBlocks(text, maxWords = 40) {
+function splitIntoMessages(text, maxWords = 40) {
   const raw = typeof text === 'string' ? text.trim() : '';
   if (!raw) return [];
 
   const words = raw.split(/\s+/).filter(Boolean);
   const chunks = [];
+  let buffer = [];
 
-  for (let i = 0; i < words.length; i += maxWords) {
-    const block = words.slice(i, i + maxWords).join(' ');
-    chunks.push(block);
+  for (const word of words) {
+    buffer.push(word);
+    if (buffer.length >= maxWords) {
+      chunks.push(buffer.join(' '));
+      buffer = [];
+    }
+  }
+
+  if (buffer.length > 0) {
+    chunks.push(buffer.join(' '));
   }
 
   return chunks;
@@ -199,15 +207,15 @@ async function processBundle(sock, chatId, message, texts) {
       combined = `${greetingPrefix}\n${combined}`.trim();
     }
 
-    const verticalized = verticalize(combined, 3);
-    const limited = limitWords(verticalized.replace(/\n/g, ' __NL__ '), 30);
+    const verticalized = verticalize(combined, 8);
+    const limited = limitWords(verticalized.replace(/\n/g, ' __NL__ '), 40);
     const finalReply = toMarkdownBlocks(
       limited.replace(/__NL__/g, '\n').replace(/\s*\n\s*/g, '\n')
     );
 
     const shouldSendImage = wantsCatalog(userText) && !detectService(userText);
 
-    const messageBlocks = splitIntoWordBlocks(finalReply, 40);
+    const messageBlocks = splitIntoMessages(finalReply, 40);
 
     if (messageBlocks.length === 0) {
       messageBlocks.push('');
