@@ -85,6 +85,21 @@ function extractTextContent(message = {}) {
   );
 }
 
+function splitIntoWordBlocks(text, maxWords = 40) {
+  const raw = typeof text === 'string' ? text.trim() : '';
+  if (!raw) return [];
+
+  const words = raw.split(/\s+/).filter(Boolean);
+  const chunks = [];
+
+  for (let i = 0; i < words.length; i += maxWords) {
+    const block = words.slice(i, i + maxWords).join(' ');
+    chunks.push(block);
+  }
+
+  return chunks;
+}
+
 function bufferMessage(sock, message) {
   const txt = extractTextContent(message?.message);
   const from = message?.key?.remoteJid;
@@ -192,13 +207,25 @@ async function processBundle(sock, chatId, message, texts) {
 
     const shouldSendImage = wantsCatalog(userText) && !detectService(userText);
 
+    const messageBlocks = splitIntoWordBlocks(finalReply, 40);
+
+    if (messageBlocks.length === 0) {
+      messageBlocks.push('');
+    }
+
     if (shouldSendImage) {
+      const [firstBlock, ...restBlocks] = messageBlocks;
       await sock.sendMessage(chatId, {
         image: { url: 'assets/Servicios.jpg' },
-        caption: finalReply
+        caption: firstBlock
       });
+      for (const block of restBlocks) {
+        await sock.sendMessage(chatId, { text: block });
+      }
     } else {
-      await sock.sendMessage(chatId, { text: finalReply });
+      for (const block of messageBlocks) {
+        await sock.sendMessage(chatId, { text: block });
+      }
     }
     await sock.sendPresenceUpdate?.('paused', chatId).catch(() => {});
   } catch (error) {
