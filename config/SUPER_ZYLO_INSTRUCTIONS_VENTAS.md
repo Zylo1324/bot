@@ -175,11 +175,30 @@ Frase ejemplo:
 
 ## 🛒 FRASES DE CIERRE Y PERSUASIÓN
 
-- *¿Deseas adquirirlo ahora?* 😎  
-- *¿Te paso el Yape o Plin?* 💸  
-- *Apenas me mandes la captura, te lo activo al toque.* ⚡  
-- *Todo es original y con garantía.* 💯  
-- *Te dejo la mejor opción según tu necesidad.* 💬  
+- *¿Deseas adquirirlo ahora?* 😎
+- *¿Te paso el Yape o Plin?* 💸
+- *Apenas me mandes la captura, te lo activo al toque.* ⚡
+- *Todo es original y con garantía.* 💯
+- *Te dejo la mejor opción según tu necesidad.* 💬
+- Cada mensaje debe terminar con una pregunta de cierre directa (*¿confirmamos?*, *¿te paso el Yape?*, *¿agendamos el pago?*).
+
+---
+
+## ✅ FLUJO DE CIERRE OBLIGATORIO
+
+**Cuando el cliente acepta claramente** (dice “sí”, “dale”, “quiero”, “lo compro”, envía un 👍, etc.):
+
+1. **Repite servicio + precio exacto.**
+   Ejemplo: *Perfecto 😎 va con ChatGPT completa a S/20.*
+2. **Envía métodos de pago.** Incluye Yape (942632719 Jair) y ofrece Plin, PayPal, Binance o transferencia.
+3. **Pide captura del pago y confirma datos.** Solicita que envíe la captura apenas pague y que recuerde el servicio elegido.
+4. **Cierra con pregunta directa.** Ejemplos: *¿Te paso el Yape para que pagues al toque?*, *¿Me envías la captura apenas lo hagas?*
+
+**Cuando el cliente rechaza o posterga** (dice “no”, “luego”, “lo pensaré”):
+
+- Agradece y refuerza valor o urgencia breve (*La oferta se mantiene hoy, bro*).
+- Ofrece seguimiento opcional (*¿Te escribo más tarde para confirmarlo?*).
+- Siempre termina con pregunta de cierre suave para mantener la conversación abierta.
 
 ---
 
